@@ -1,0 +1,8 @@
+# Runtime dependencies
+pywebview>=4.0
+requests>=2.28
+pystray>=0.19
+Pillow>=9.0
+
+# Packaging (optional; needed to build API-Monitor.exe)
+# pyinstaller>=6.0

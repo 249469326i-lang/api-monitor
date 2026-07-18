@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Monitor</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%231a1c2c'/><rect x='16' y='58' width='16' height='26' fill='%2300e436'/><rect x='42' y='38' width='16' height='46' fill='%2329adff'/><rect x='68' y='18' width='16' height='66' fill='%23ffec27'/></svg>">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css?v=20260718-pixel-final">
+</head>
+<body>
+    <div class="app">
+
+        <!-- ============ Top Navigation ============ -->
+        <nav class="topnav">
+            <!-- 底层拖拽热区：空白处命中此层即可拖动无边框窗口。
+                 交互控件 z-index 更高，不会被拖拽劫持。 -->
+            <div class="topnav-drag-region pywebview-drag-region" aria-hidden="true"></div>
+
+            <div class="nav-brand pywebview-drag-region" id="navBrand">
+                <span class="brand-mark" aria-hidden="true">▌</span>
+                API MONITOR
+                <span class="status-dot" id="serviceDot"></span>
+                <span class="brand-online mono" id="brandOnline">ONLINE<span class="px-cursor">_</span></span>
+            </div>
+
+            <button class="nav-btn" id="featuresBtn" title="导入/导出">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+                    <rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+                </svg>
+                Features
+            </button>
+
+            <button class="nav-btn notif-btn" id="notifBtn" title="通知">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+                    <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+                </svg>
+                <span class="notif-badge" id="notifBadge" style="display:none;">0</span>
+            </button>
+
+            <div class="nav-search">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                </svg>
+                <input type="text" placeholder="> SEARCH NODE..." id="searchInput">
+            </div>
+
+            <div class="nav-spacer pywebview-drag-region"></div>
+
+            <button class="nav-dashboard" id="launchBtn">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                </svg>
+                启动服务
+            </button>
+
+            <div class="nav-avatar" id="settingsAvatar" title="设置">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                </svg>
+            </div>
+        </nav>
+
+        <!-- Window controls (frameless) -->
+        <div class="window-controls">
+            <button class="win-btn" id="winMinBtn" title="最小化">
+                <svg width="10" height="10" viewBox="0 0 10 1"><rect width="10" height="1" fill="currentColor"/></svg>
+            </button>
+            <button class="win-btn" id="winMaxBtn" title="最大化">
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="0.5" y="0.5" width="9" height="9"/></svg>
+            </button>
+            <button class="win-btn win-close" id="winCloseBtn" title="关闭">
+                <svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor" stroke-width="1.2"><line x1="1" y1="1" x2="9" y2="9"/><line x1="9" y1="1" x2="1" y2="9"/></svg>
+            </button>
+        </div>
+
+        <!-- ============ Main Content ============ -->
+        <div class="content">
+
+            <!-- Scan ribbon: fires during full/fast test -->
+            <div class="scan-ribbon" id="scanRibbon" aria-hidden="true"></div>
+
+            <!-- Metrics: 1 hero (rate) + 3 side cards -->
+            <div class="metrics-row">
+                <div class="metric-card mc-rate mc-hero">
+                    <div class="metric-scene" data-scene="rate" aria-hidden="true"></div>
+                    <div class="metric-header">
+                        <span class="metric-label">RATE · 成功率</span>
+                        <div class="metric-icon mi-amber">%</div>
+                    </div>
+                    <div class="metric-hero-body">
+                        <div class="metric-value mono" id="mcSuccessRate">--<span class="metric-unit">%</span></div>
+                        <div class="metric-hero-meta">
+                            <span class="metric-chip" id="mcRateSummary">等待测试</span>
+                            <span class="metric-chip mono" id="mcAvgLatencyChip">AVG --</span>
+                        </div>
+                    </div>
+                    <div class="metric-footer">
+                        <div class="progress-wrap px-slot" id="mcProgressWrap">
+                            <div class="progress-bar" id="mcProgressBar" style="width:0%;"></div>
+                            <div class="progress-ticks" aria-hidden="true"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="metric-card mc-total">
+                    <div class="metric-scene" data-scene="nodes" aria-hidden="true"></div>
+                    <div class="metric-header">
+                        <span class="metric-label">NODES</span>
+                        <div class="metric-icon mi-blue">N</div>
+                    </div>
+                    <div class="metric-value mono" id="mcTotal">0</div>
+                    <div class="metric-footer">
+                        <div class="brick-track" id="mcTotalBricks" data-tone="blue" aria-hidden="true"></div>
+                        <div class="brick-caption mono" id="mcTotalCap">0/12</div>
+                    </div>
+                </div>
+                <div class="metric-card mc-online">
+                    <div class="metric-scene" data-scene="ok" aria-hidden="true"></div>
+                    <div class="metric-header">
+                        <span class="metric-label">OK</span>
+                        <div class="metric-icon mi-green">✓</div>
+                    </div>
+                    <div class="metric-value mv-green mono" id="mcOk">0</div>
+                    <div class="metric-footer">
+                        <div class="brick-track" id="mcOkBricks" data-tone="green" aria-hidden="true"></div>
+                        <div class="brick-caption mono" id="mcOkCap">0/12</div>
+                    </div>
+                </div>
+                <div class="metric-card mc-offline" id="mcOfflineCard">
+                    <div class="metric-scene" data-scene="err" aria-hidden="true"></div>
+                    <div class="metric-header">
+                        <span class="metric-label">ERR</span>
+                        <div class="metric-icon mi-red">!</div>
+                    </div>
+                    <div class="metric-value mv-red mono" id="mcFail">0</div>
+                    <div class="metric-footer">
+                        <div class="brick-track" id="mcFailBricks" data-tone="red" aria-hidden="true"></div>
+                        <div class="brick-caption mono" id="mcFailCap">0/12</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Hidden elements for JS compatibility -->
+            <div style="display:none;">
+                <span id="metricProviderCount">0</span>
+                <span id="mcLatencyValue">--</span>
+                <span id="mcAvgLatency">--</span>
+                <span id="mcSettings">Settings</span>
+                <div id="mcIconAll"></div><div id="mcIconOk"></div><div id="mcIconFail"></div><div id="mcIconStar"></div>
+            </div>
+
+            <!-- Bottom Grid -->
+            <div class="bottom-grid">
+
+                <!-- Left: Provider List Card -->
+                <div class="provider-list-card">
+                    <div class="plc-header">
+                        <div class="plc-title">NODE LIST <span class="plc-count mono" id="providerCount">0 NODES</span></div>
+                    </div>
+                    <div class="plc-toolbar">
+                        <button class="tb-btn tb-cta" id="fastTestBtn" title="快速测试 (T)">
+                            ⚡ 快速测试
+                        </button>
+                        <button class="tb-btn tb-stop" id="stopBtn" title="停止测试" hidden>
+                            ■ 停止
+                        </button>
+                        <button class="tb-btn" id="mcFullTestBtn" title="完整测试">
+                            完整测试
+                        </button>
+                        <div class="tb-sep"></div>
+                        <button class="tb-btn" id="refreshBtn" title="刷新">刷新</button>
+                        <button class="tb-btn" id="addBtn" title="新增">+ 新增</button>
+                        <button class="tb-btn" id="importBtn" title="导入">导入</button>
+                        <div class="toolbar-right">
+                            <button class="tb-btn" id="selectModeBtn" title="多选">选择</button>
+                        </div>
+                    </div>
+                    <!-- 批量操作栏 -->
+                    <div class="batch-bar" id="batchBar">
+                        <span id="batchCount" class="mono">SEL 00</span>
+                        <button class="btn-sm" id="batchTestBtn">批量测试</button>
+                        <button class="btn-sm" id="batchBackupBtn">设为备用</button>
+                        <button class="btn-sm btn-danger-sm" id="batchDeleteBtn">批量删除</button>
+                        <button class="btn-sm btn-ghost-sm" id="batchClearBtn">取消</button>
+                    </div>
+                    <div class="table-container">
+                        <table class="provider-table">
+                            <thead>
+                                <tr>
+                                    <th class="col-check"><input type="checkbox" id="selectAllCheck" title="全选"></th>
+                                    <th>NODE</th>
+                                    <th>ENDPOINT</th>
+                                    <th>ROLE</th>
+                                    <th class="col-ping">PING</th>
+                                    <th>STAT</th>
+                                </tr>
+                            </thead>
+                            <tbody id="providerTableBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Right: Detail Card -->
+                <div class="detail-card">
+                    <!-- Provider Header：仅在选中提供商后显示，避免未选时出现头像「-」和两行短横线 -->
+                    <div class="dc-provider-header" id="dcProviderHeader" aria-hidden="true">
+                        <div class="dc-avatar" id="dcAvatar"></div>
+                        <div class="dc-provider-info">
+                            <div class="dc-provider-name" id="dcProviderName"></div>
+                            <div class="dc-provider-endpoint" id="dcProviderEndpoint"></div>
+                        </div>
+                        <div class="dc-provider-status" id="dcProviderStatus"></div>
+                    </div>
+                    <div class="dc-head">
+                        <div class="dc-tabs">
+                            <button class="dc-tab active" data-tab="test">测试结果</button>
+                            <button class="dc-tab" data-tab="basic">基本信息</button>
+                            <button class="dc-tab" data-tab="trend">趋势</button>
+                            <button class="dc-tab" data-tab="cli">CLI</button>
+                        </div>
+                        <div class="dc-head-actions" id="dcActions" style="display:none;">
+                            <button class="dc-action-btn" id="testOneBtn" title="测试">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                            </button>
+                            <button class="dc-action-btn" id="setCurrentBtn" title="设为当前">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                            </button>
+                            <button class="dc-action-btn" id="editBtn" title="编辑">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                            </button>
+                            <button class="dc-action-btn danger" id="deleteBtn" title="删除">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="dc-body" id="dcBody">
+                        <div class="empty-state" id="emptyState">
+                            <div class="empty-stage" aria-hidden="true"></div>
+                            <div class="empty-panel">
+                                <div class="empty-icon">▶</div>
+                                <h3>SELECT A NODE</h3>
+                                <p>PICK LEFT LIST · VIEW TEST / TREND / CLI</p>
+                                <div class="empty-actions">
+                                    <button type="button" class="tb-btn tb-cta" id="emptyAddBtn">+ ADD</button>
+                                    <button type="button" class="tb-btn" id="emptyImportBtn">IMPORT</button>
+                                    <button type="button" class="tb-btn" id="emptyTestBtn">⚡ TEST</button>
+                                </div>
+                                <div class="empty-cli mono" id="emptyCliPreview" aria-hidden="true">
+                                    <div class="empty-cli-line ok">[SYS] API Monitor ready</div>
+                                    <div class="empty-cli-line info">[TIP] Press T to fast-test</div>
+                                    <div class="empty-cli-line info">[SCN] detail lounge online</div>
+                                    <div class="empty-cli-line">> <span class="px-cursor">█</span></div>
+                                </div>
+                                <div class="empty-hint" id="emptyHint" style="display:none;">
+                                    还没有提供商，点击 <a href="#" id="emptyAddLink">新增</a> 或
+                                    <a href="#" id="emptyImportLink">从 cc-switch 导入</a>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="detail-info" id="detailInfo" style="display:none;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    <div class="status-bar" id="statusBar">
+        <div class="status-bar-left">
+            <span class="status-chip" id="statusScheduler" title="定时测试状态">
+                <span class="status-k">AUTO</span>
+                <span class="status-v mono" id="statusSchedulerVal">OFF</span>
+            </span>
+            <span class="status-sep" aria-hidden="true">/</span>
+            <span class="status-chip" id="statusFailover" title="故障切换状态">
+                <span class="status-k">FO</span>
+                <span class="status-v mono" id="statusFailoverVal">—</span>
+            </span>
+        </div>
+        <div class="status-bar-right">
+            <span class="status-chip status-chip--keys" id="statusHint" title="快捷键">
+                <span class="status-k">KEYS</span>
+                <span class="status-v mono">R REFRESH · T TEST · , CFG · ESC</span>
+            </span>
+        </div>
+    </div>
+    <div class="failover-banner" id="failoverBanner" style="display:none;">
+        <span class="failover-kicker">! FAILOVER</span>
+        <span id="failoverBannerText">建议故障切换</span>
+        <div class="failover-banner-actions">
+            <button class="btn btn-primary btn-sm" id="failoverConfirmBtn">确认切换</button>
+            <button class="btn btn-secondary btn-sm" id="failoverCancelBtn">取消</button>
+        </div>
+    </div>
+
+    </div>
+
+    <!-- ============ Provider Modal ============ -->
+    <div class="modal-overlay" id="providerModal">
+        <div class="modal">
+            <div class="modal-head">
+                <h3 id="modalTitle">新增提供商</h3>
+                <button class="modal-close" id="modalCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="modalProviderId">
+                <div class="form-row">
+                    <label>名称 <span class="req">*</span></label>
+                    <input type="text" id="fName" placeholder="例：OpenRouter">
+                </div>
+                <div class="form-grid-2">
+                    <div class="form-row">
+                        <label>应用类型</label>
+                        <div class="custom-select" id="fAppType" data-value="claude">
+                            <div class="custom-select-display">
+                                <span class="custom-select-text">claude</span>
+                                <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </div>
+                            <div class="custom-select-dropdown">
+                                <div class="custom-select-option" data-value="claude">claude</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <label>角色</label>
+                        <div class="custom-select" id="fRole" data-value="备用">
+                            <div class="custom-select-display">
+                                <span class="custom-select-text">备用</span>
+                                <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </div>
+                            <div class="custom-select-dropdown">
+                                <div class="custom-select-option" data-value="备用">备用</div>
+                                <div class="custom-select-option" data-value="当前">当前</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <label>端点 URL <span class="req">*</span></label>
+                    <input type="text" id="fEndpoint" placeholder="https://api.example.com/v1">
+                </div>
+                <div class="form-row">
+                    <label>API Key</label>
+                    <input type="text" id="fApiKey" placeholder="sk-...">
+                </div>
+                <div class="form-grid-2">
+                    <div class="form-row" style="position:relative;">
+                        <label>默认模型</label>
+                        <div class="model-input-group">
+                            <input type="text" id="fDefaultModel" placeholder="claude-haiku-4-5">
+                            <button type="button" class="btn-fetch-models" id="fetchModelsBtn" title="从端点获取模型列表">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                    <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="model-dropdown" id="modelDropdown" style="display:none;"></div>
+                    </div>
+                    <div class="form-row">
+                        <label>API 格式</label>
+                        <div class="custom-select" id="fApiFormat" data-value="">
+                            <div class="custom-select-display">
+                                <span class="custom-select-text">自动检测</span>
+                                <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </div>
+                            <div class="custom-select-dropdown">
+                                <div class="custom-select-option" data-value="">自动检测</div>
+                                <div class="custom-select-option" data-value="anthropic_messages">Anthropic Messages</div>
+                                <div class="custom-select-option" data-value="openai_chat">OpenAI Chat Completions</div>
+                                <div class="custom-select-option" data-value="openai_responses">OpenAI Responses API</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <label>分类</label>
+                    <input type="text" id="fCategory" placeholder="主用/备用">
+                </div>
+                <div class="form-row">
+                    <label>备注</label>
+                    <textarea id="fNotes" rows="2" placeholder="可选"></textarea>
+                </div>
+            </div>
+            <div class="modal-foot">
+                <button class="btn-ghost" id="modalCancelBtn">取消</button>
+                <button class="btn-primary" id="modalSaveBtn">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ About Modal ============ -->
+    <div class="modal-overlay" id="aboutModal">
+        <div class="modal modal-narrow">
+            <div class="modal-head">
+                <h3>关于</h3>
+                <button class="modal-close" id="aboutCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body about-body" id="aboutBody"></div>
+        </div>
+    </div>
+
+    <!-- ============ Confirm Modal ============ -->
+    <div class="modal-overlay" id="confirmModal">
+        <div class="modal modal-narrow">
+            <div class="modal-head">
+                <h3 id="confirmTitle">确认操作</h3>
+            </div>
+            <div class="modal-body">
+                <p id="confirmMessage" style="font-size:13px;font-weight:500;line-height:1.7;color:var(--text-secondary);"></p>
+            </div>
+            <div class="modal-foot">
+                <button class="btn-ghost" id="confirmCancelBtn">取消</button>
+                <button class="btn-danger" id="confirmOkBtn">确认删除</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Settings Modal ============ -->
+    <div class="modal-overlay" id="settingsModal">
+        <div class="modal modal-wide">
+            <div class="modal-head">
+                <h3>CONFIG</h3>
+                <button class="modal-close" id="settingsCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body settings-body" id="settingsBody">
+                <div class="settings-section">
+                    <h4><span class="settings-sec-code">01</span> TEST</h4>
+                    <div class="settings-row">
+                        <label>AUTO INTERVAL</label>
+                        <select id="setAutoInterval">
+                            <option value="0">OFF</option>
+                            <option value="300">5 MIN</option>
+                            <option value="900">15 MIN</option>
+                            <option value="1800">30 MIN</option>
+                            <option value="3600">60 MIN</option>
+                        </select>
+                    </div>
+                    <div class="settings-row">
+                        <label>CONCURRENCY</label>
+                        <select id="setConcurrency">
+                            <option value="1">x1</option>
+                            <option value="3">x3</option>
+                            <option value="5">x5</option>
+                        </select>
+                    </div>
+                    <div class="settings-row">
+                        <label>TIMEOUT (S)</label>
+                        <input type="number" id="setTimeout" min="5" max="120" value="30">
+                    </div>
+                    <div class="settings-row">
+                        <label>RETRIES</label>
+                        <input type="number" id="setRetries" min="0" max="5" value="2">
+                    </div>
+                </div>
+                <div class="settings-section">
+                    <h4><span class="settings-sec-code">02</span> SECURITY</h4>
+                    <div class="settings-row">
+                        <label>SSL VERIFY</label>
+                        <label class="toggle"><input type="checkbox" id="setSslVerify"><span class="toggle-slider"></span></label>
+                    </div>
+                    <p class="settings-hint">STRICT SSL · SELF-SIGNED WILL FAIL</p>
+                    <div class="settings-row">
+                        <label>SYNC CLAUDE ON BOOT</label>
+                        <label class="toggle"><input type="checkbox" id="setAutoSyncClaude" checked><span class="toggle-slider"></span></label>
+                    </div>
+                    <p class="settings-hint">DETECT CC CONFIG · AUTO-ADD IF MISSING</p>
+                </div>
+                <div class="settings-section">
+                    <h4><span class="settings-sec-code">03</span> FAILOVER</h4>
+                    <div class="settings-row">
+                        <label>ENABLE FO</label>
+                        <label class="toggle"><input type="checkbox" id="setFailoverEnabled"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="settings-row">
+                        <label>CONFIRM SWITCH</label>
+                        <label class="toggle"><input type="checkbox" id="setFailoverConfirm"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="settings-row">
+                        <label>MAX SWITCHES</label>
+                        <input type="number" id="setMaxSwitches" min="1" max="10" value="3">
+                    </div>
+                    <div class="settings-row">
+                        <label>COOLDOWN (S)</label>
+                        <input type="number" id="setFailoverCooldown" min="60" max="3600" value="300">
+                    </div>
+                </div>
+                <div class="settings-section">
+                    <h4><span class="settings-sec-code">04</span> NOTIFY</h4>
+                    <div class="settings-row">
+                        <label>STATUS ALERTS</label>
+                        <label class="toggle"><input type="checkbox" id="setNotifyStatus"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="settings-row">
+                        <label>FO ALERTS</label>
+                        <label class="toggle"><input type="checkbox" id="setNotifyFailover"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="settings-row">
+                        <label>TEST DONE ALERTS</label>
+                        <label class="toggle"><input type="checkbox" id="setNotifyComplete"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="settings-row">
+                        <label>WEBHOOK</label>
+                        <input type="text" id="setWebhookUrl" placeholder="https://hooks.slack.com/...">
+                    </div>
+                </div>
+                <div class="settings-section">
+                    <h4><span class="settings-sec-code">05</span> DATA</h4>
+                    <div class="settings-row">
+                        <label>HISTORY DAYS</label>
+                        <input type="number" id="setRetentionDays" min="7" max="365" value="30">
+                    </div>
+                    <div class="settings-actions">
+                        <button class="btn-sm" id="exportCsvBtn">CSV NODES</button>
+                        <button class="btn-sm" id="exportJsonBtn">JSON NODES</button>
+                        <button class="btn-sm" id="exportHistoryBtn">CSV HIST</button>
+                        <button class="btn-sm" id="backupBtn">BACKUP DB</button>
+                        <button class="btn-ghost-sm" id="restoreBtn">RESTORE</button>
+                        <button class="btn-sm" id="backupNowBtn">BACKUP NOW</button>
+                    </div>
+                    <div class="settings-row" style="align-items:flex-start;">
+                        <label>AUTO BACKUP</label>
+                        <label class="toggle"><input type="checkbox" id="setAutoBackup"><span class="toggle-slider"></span></label>
+                    </div>
+                    <p class="settings-hint">AUTO BACKUP EVERY 24H WHEN ON</p>
+                    <div class="settings-row" style="align-items:flex-start;">
+                        <label>LOCAL BACKUPS</label>
+                        <div id="backupList" class="backup-list">NO BACKUPS</div>
+                    </div>
+                </div>
+                <div class="settings-section">
+                    <h4><span class="settings-sec-code">06</span> RESIDENT</h4>
+                    <div class="settings-row">
+                        <label>START ON BOOT</label>
+                        <label class="toggle"><input type="checkbox" id="setStartOnBoot"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="settings-row">
+                        <label>CLOSE TO TRAY</label>
+                        <label class="toggle"><input type="checkbox" id="setMinimizeToTray" checked><span class="toggle-slider"></span></label>
+                    </div>
+                    <p class="settings-hint">HIDE TO TRAY · KEEP AUTO TEST &amp; FAILOVER</p>
+                </div>
+                <div class="settings-section">
+                    <h4><span class="settings-sec-code">07</span> SCENE BG</h4>
+                    <p class="settings-hint">GIF / WEBP / PNG URL · LEAVE EMPTY = DEFAULT PIXEL LOOPS · LOCAL ONLY</p>
+                    <div class="settings-row">
+                        <label>RATE BG</label>
+                        <input type="text" id="setBgRate" placeholder="assets/metric-bg/rate.gif">
+                    </div>
+                    <div class="settings-row">
+                        <label>NODES BG</label>
+                        <input type="text" id="setBgNodes" placeholder="assets/metric-bg/nodes.gif">
+                    </div>
+                    <div class="settings-row">
+                        <label>OK BG</label>
+                        <input type="text" id="setBgOk" placeholder="assets/metric-bg/ok.gif">
+                    </div>
+                    <div class="settings-row">
+                        <label>ERR BG</label>
+                        <input type="text" id="setBgErr" placeholder="assets/metric-bg/err.gif">
+                    </div>
+                    <div class="settings-row">
+                        <label>DETAIL BG</label>
+                        <input type="text" id="setBgDetail" placeholder="assets/metric-bg/detail.gif">
+                    </div>
+                    <div class="settings-actions">
+                        <button type="button" class="btn-sm" id="bgResetBtn">RESET DEFAULTS</button>
+                        <button type="button" class="btn-sm" id="bgPreviewBtn">PREVIEW</button>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-foot">
+                <button class="btn-ghost" id="settingsCancelBtn">CANCEL</button>
+                <button class="btn-primary" id="settingsSaveBtn">SAVE</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Notification Dropdown ============ -->
+    <div class="notif-dropdown" id="notifDropdown" style="display:none;">
+        <div class="notif-head">
+            <span>NOTIFY</span>
+            <button class="notif-mark-read" id="markAllReadBtn">MARK ALL</button>
+        </div>
+        <div class="notif-list" id="notifList">
+            <div class="notif-empty">NO ALERTS</div>
+        </div>
+    </div>
+
+    <!-- ============ Toast ============ -->
+    <div class="toast" id="toast"></div>
+
+    <script src="js/app.js?v=20260718-basic-order1"></script>
+</body>
+</html>

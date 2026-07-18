@@ -1,0 +1,69 @@
+# Build artifacts
+build/
+dist/
+*.spec.bak
+*.exe
+API-Monitor.exe
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Local data / secrets (runtime lives in %APPDATA%)
+*.db
+*.sqlite
+*.sqlite3
+providers.db
+*.key
+*.pem
+secrets/
+.credentials/
+
+# IDE / editor / AI tooling (local only)
+.idea/
+.vscode/
+.trae/
+.veai/
+.claude/
+.uploads/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temp
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# Probe / internal debug scripts (do not publish)
+_probe_*.py
+web/_shoot*.py
+web/_bg_test.html
+web/_pixel_preview.*
+
+# Backup files
+*.bak
+*.bak-*
+*.orig
+*~
+web/css/*.bak*
+
+# Prototypes (design exploration; not runtime)
+web/prototype-*.html
+web/prototypes/
+
+# Optional local packaging leftovers
+*.manifest
+warn-*.txt
+xref-*.html
