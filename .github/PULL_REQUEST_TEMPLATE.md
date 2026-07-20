@@ -11,11 +11,10 @@
 
 ## 测试情况
 
-<!-- 如何验证的？ -->
+<!-- 如何验证的？命令以 CONTRIBUTING.md「提交改动前」为准 -->
 
-- [ ] `python verify_backend.py` 通过
-- [ ] `python -m unittest test_fetch_models_isolation -v` 通过
-- [ ] 已用 `rebuild.bat` 验证打包正常（涉及 `main.py` / `core/` / `web/` 改动时）
+- [ ] 已按 [CONTRIBUTING.md](../CONTRIBUTING.md#提交改动前) 跑通验证脚本
+- [ ] 涉及 `main.py` / `core/` / `web/` 时已用 `rebuild.bat` 验证打包
 
 ## 截图
 

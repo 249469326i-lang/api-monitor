@@ -94,15 +94,17 @@
 ## 3. 目录结构
 
 ```
-CC Switch Monitor/
+api-monitor/
 ├── main.py                    # 应用入口：定义 API 类 + main() 启动 PyWebView
 ├── verify_backend.py          # 后端 API 验证脚本（逐个真实调用 main.API 方法）
-├── requirements.txt           # 依赖（仅 pywebview>=4.0）
+├── test_fetch_models_isolation.py  # 模型拉取隔离性单元测试
+├── bump_version.py            # 发版时统一更新各处版本号
+├── requirements.txt           # 运行时依赖
+├── requirements-dev.txt       # 开发/打包依赖
 ├── CC-Switch-Monitor.spec     # PyInstaller 打包配置
 ├── rebuild.bat                # Windows 一键重建 EXE 脚本
 ├── cc_switch_icon.ico         # 应用图标
 ├── file_version_info.txt      # EXE 版本信息资源
-├── API-Monitor.exe            # 已构建的可执行文件
 ├── core/                      # 核心业务逻辑模块
 │   ├── __init__.py            # 导出所有子模块
 │   ├── db.py                  # SQLite 数据库操作（CRUD + 历史统计 + 设置 + 通知）
@@ -114,15 +116,18 @@ CC Switch Monitor/
 │   ├── export.py              # CSV/JSON 导出 + 数据库备份/恢复
 │   ├── validators.py          # 输入校验（端点/名称/Key/模型名）
 │   ├── crypto.py              # Windows DPAPI 加解密 API Key
+│   ├── tray.py                # 系统托盘菜单与图标
+│   ├── autostart.py           # 开机自启注册
 │   ├── updater.py             # GitHub Releases 新版本检查
 │   └── logging_config.py      # RotatingFileHandler 配置 + Key 脱敏
 ├── web/                       # 前端单页应用
 │   ├── index.html            # 主页面（含顶栏/指标卡/列表/详情面板/模态框）
-│   ├── css/style.css         # 样式（Neo-Brutalist 风格）
+│   ├── css/style.css         # 样式
 │   ├── js/app.js             # 前端逻辑（App 类 + MockBackend 类）
 │   └── prototypes/           # UI 原型设计稿（设计参考，非运行时依赖）
-├── docs/                      # 设计文档与实施计划
-└── build/, dist/              # PyInstaller 构建产物（临时）
+├── docs/                      # 设计文档、CODE_WIKI 与截图
+├── .github/                   # Issue / PR 模板
+└── build/, dist/              # PyInstaller 构建产物（临时，不进仓库）
 ```
 
 ---
@@ -229,7 +234,15 @@ CC Switch Monitor/
 - 非 Windows 平台自动降级为明文。
 - `migrate_provider_keys()` 批量迁移明文 Key。
 
-### 4.11 `core/updater.py` — 自动更新检查
+### 4.11 `core/tray.py` — 系统托盘
+
+**职责**：创建托盘图标与右键菜单（显示主窗口 / 快速测试全部 / 退出），并在悬停 tooltip 中展示应用版本等信息。
+
+### 4.12 `core/autostart.py` — 开机自启
+
+**职责**：通过 Windows 注册表或启动项接口注册/取消开机自启。
+
+### 4.13 `core/updater.py` — 自动更新检查
 
 **职责**：调用 GitHub Releases API 检查新版本。
 
@@ -237,7 +250,7 @@ CC Switch Monitor/
 - 优先返回 `.exe` 资源下载链接。
 - `_compare_versions()` 语义化版本比较。
 
-### 4.12 `core/logging_config.py` — 日志配置
+### 4.14 `core/logging_config.py` — 日志配置
 
 **职责**：`RotatingFileHandler`（5MB×3）+ API Key 脱敏函数。
 

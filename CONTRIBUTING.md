@@ -74,3 +74,4 @@ python main.py
 2. `rebuild.bat` 构建 `API-Monitor.exe`
 3. 提交代码并在 GitHub 新建 Release（tag 形如 `v3.x.y`），上传 exe 作为 Release Asset
 4. 客户端自动更新仅检查 GitHub Releases，Release 发布即生效
+5. 若 README 路线图等文档仍写死旧版本字面量，一并改为功能描述或「当前已发布版本」，不要再新增版本号拷贝处

@@ -108,27 +108,20 @@ pyinstaller --noconfirm --clean CC-Switch-Monitor.spec
 
 ```text
 api-monitor/
-├── main.py                        # 程序入口（PyWebView + 后端 API 桥接）
-├── core/                          # 后端核心模块
-│   ├── providers.py               # 供应商管理
-│   ├── testing.py                 # 延迟 / 可用性探测
-│   ├── failover.py                # 故障转移
-│   ├── scheduler.py               # 定时任务
-│   ├── crypto.py                  # DPAPI 密钥加密
-│   ├── tray.py                    # 系统托盘
-│   ├── updater.py                 # 自动更新（检查 GitHub Releases）
-│   └── ...
-├── web/                           # 前端 UI（index.html / css / js / assets）
-├── docs/                          # 设计文档、CODE_WIKI 与截图
-├── CC-Switch-Monitor.spec         # PyInstaller 打包规格
-├── rebuild.bat                    # 一键重打包脚本
-├── verify_backend.py              # 后端 API 冒烟验证脚本
-├── test_fetch_models_isolation.py # 模型拉取隔离性单元测试
-├── bump_version.py                # 发版时统一更新各处版本号
-└── requirements.txt               # 运行时依赖
+├── main.py                 # 程序入口（PyWebView + 后端 API 桥接）
+├── core/                   # 后端核心模块（探测、故障转移、托盘、更新等）
+├── web/                    # 前端 UI（index.html / css / js / assets）
+├── docs/                   # 设计文档、CODE_WIKI 与截图
+├── .github/                # Issue / PR 模板
+├── CC-Switch-Monitor.spec  # PyInstaller 打包规格
+├── rebuild.bat             # 一键重打包脚本
+├── bump_version.py         # 发版时统一更新各处版本号
+├── verify_backend.py       # 后端 API 冒烟验证脚本
+├── test_fetch_models_isolation.py
+└── requirements.txt        # 运行时依赖
 ```
 
-更详细的架构说明见 [docs/CODE_WIKI.md](docs/CODE_WIKI.md)。
+模块级目录树与职责说明以 [docs/CODE_WIKI.md](docs/CODE_WIKI.md) 为准，避免多处维护分叉。
 
 ## ⚙️ 配置与数据
 
@@ -141,26 +134,19 @@ api-monitor/
 
 ## ✅ 运行测试
 
-```bash
-# 后端 API 冒烟测试（真实调用每个后端方法）
-python verify_backend.py
-
-# 单元测试（模型拉取隔离性）
-python -m unittest test_fetch_models_isolation -v
-```
+提交前请按 [贡献指南 · 提交改动前](CONTRIBUTING.md#提交改动前) 跑通验证命令（`verify_backend.py` 与单元测试）。完整步骤与打包检查也写在该文档，避免多处拷贝命令过期。
 
 ## 🔐 安全说明
 
-- API Key 使用 **Windows DPAPI** 加密后存储，仅当前 Windows 用户可解密
-- 单实例互斥锁，避免重复启动产生多个托盘图标
-- 自动更新仅查询本仓库的 GitHub Releases，不访问其他服务器
-- 请勿将真实 API Key、`providers.db` 或本地配置提交到 git
+- API Key 使用 **Windows DPAPI** 本地加密，仅当前 Windows 用户可解密
+- 请勿提交真实 API Key、`providers.db` 或本地配置
+- 自动更新仅检查本仓库 GitHub Releases（可在设置中关闭）
 
-发现安全问题？请阅读 [SECURITY.md](SECURITY.md)，**不要**直接开公开 Issue。
+完整说明与漏洞报告方式见 [SECURITY.md](SECURITY.md)。**不要**直接开公开 Issue 报告安全问题。
 
 ## 🗺️ 路线图
 
-- [x] v3.0.0 — 像素风 UI、独立 Provider 存储、自动更新
+- [x] 像素风 UI、独立 Provider 存储、自动更新（当前已发布版本）
 - [ ] 探测历史图表与数据导出增强
 - [ ] 更多供应商预设模板
 - [ ] 多语言界面（欢迎 PR）
