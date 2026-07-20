@@ -50,7 +50,7 @@ python main.py
 
 ## 报告 Bug
 
-使用 [Bug Report 模板](https://github.com/249469326i-lang/api-monitor/issues/new) 提交，请包含：
+使用 [Bug Report 模板](https://github.com/249469326i-lang/api-monitor/issues/new?template=bug_report.md) 提交，请包含：
 
 - 系统版本与应用版本
 - 复现步骤
@@ -63,7 +63,14 @@ python main.py
 
 ## 发布流程（维护者）
 
-1. 更新 `main.py` 中 `__version__`、`file_version_info.txt`、`rebuild.bat` 中的版本号
+1. 统一更新版本号（**必须**用脚本，手动改容易漏掉 `main.py` 导致自动更新失效）：
+
+   ```bash
+   python bump_version.py 3.x.y
+   ```
+
+   该脚本会同步 `main.py`、`file_version_info.txt`、`rebuild.bat` 三处的全部版本号。
+
 2. `rebuild.bat` 构建 `API-Monitor.exe`
-3. 在 GitHub 新建 Release（tag 形如 `v3.x.x`），上传 exe 作为 Release Asset
+3. 提交代码并在 GitHub 新建 Release（tag 形如 `v3.x.y`），上传 exe 作为 Release Asset
 4. 客户端自动更新仅检查 GitHub Releases，Release 发布即生效

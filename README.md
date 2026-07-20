@@ -51,6 +51,8 @@
 2. 下载最新版本的 `API-Monitor.exe`
 3. 双击运行，无需安装
 
+> ⚠️ **前置条件**：需要系统已安装 **Microsoft Edge WebView2 Runtime**（Windows 10/11 通常已自带；LTSC 或精简版系统可能缺失，需自行安装）。
+>
 > ⚠️ **关于 SmartScreen 提示**：程序未购买代码签名证书，首次运行可能出现 Windows SmartScreen 警告，点击「更多信息 → 仍要运行」即可。不放心的话欢迎直接从源码构建（见下文）。
 
 首次运行会在 `%APPDATA%\.cc-switch-monitor\` 下创建本地配置与数据库。
@@ -100,6 +102,8 @@ pyinstaller --noconfirm --clean CC-Switch-Monitor.spec
 
 产物为单文件 `API-Monitor.exe`（约 30–35 MB），已内置 `web/` 前端资源，可直接拷贝给没有 Python 环境的 Windows 机器使用。
 
+> 正式版本一律通过 [GitHub Releases](https://github.com/249469326i-lang/api-monitor/releases) 分发，exe **不会**提交进源码仓库——请只从 Releases 页下载，谨防第三方镜像篡改。
+
 ## 🗂️ 项目结构
 
 ```text
@@ -120,6 +124,7 @@ api-monitor/
 ├── rebuild.bat                    # 一键重打包脚本
 ├── verify_backend.py              # 后端 API 冒烟验证脚本
 ├── test_fetch_models_isolation.py # 模型拉取隔离性单元测试
+├── bump_version.py                # 发版时统一更新各处版本号
 └── requirements.txt               # 运行时依赖
 ```
 
@@ -132,7 +137,7 @@ api-monitor/
 | `%APPDATA%\.cc-switch-monitor\` | 本地配置、加密后的 Key、历史探测数据 |
 | 应用内「设置」 | 超时、重试次数、探测间隔、开机自启、自动更新等 |
 
-所有数据均保存在用户目录，**不会**写入程序安装目录，也**不会**上传到任何第三方服务器。
+所有数据均保存在用户目录，**不会**写入程序安装目录。网络请求仅发往两类目标：你在应用内自行配置的 API 端点（探测时需携带对应 Key，这是监控功能本身），以及本仓库的 GitHub Releases（自动更新检查，可在设置中关闭）。此外不向任何服务器发送数据。
 
 ## ✅ 运行测试
 
