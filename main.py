@@ -394,7 +394,7 @@ class API:
             on_show=on_show,
             on_quit=on_quit,
             on_quick_test=on_quick_test,
-            tooltip=f"CC Switch Monitor v{__version__}",
+            tooltip=f"API Monitor v{__version__}",
         )
         if controller.start():
             self._tray = controller
@@ -636,7 +636,7 @@ class API:
         return {
             "name": "API Monitor",
             "version": __version__,
-            "description": "个人用 Claude Code 供应商监控与故障切换",
+            "description": "Windows 桌面端 API 供应商监控与故障切换",
             "author": "API Monitor Project",
             "repo": APP_REPO,
         }

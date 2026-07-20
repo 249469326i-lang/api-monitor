@@ -46,7 +46,7 @@ class TrayController:
         on_show: Callable[[], None],
         on_quit: Callable[[], None],
         on_quick_test: Optional[Callable[[], None]] = None,
-        tooltip: str = "CC Switch Monitor",
+        tooltip: str = "API Monitor",
     ):
         self._on_show = on_show
         self._on_quit = on_quit

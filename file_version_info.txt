@@ -19,7 +19,7 @@ VSVersionInfo(
         StringStruct(u'FileDescription', u'API Monitor - API Provider Monitor'),
         StringStruct(u'FileVersion', u'3.0.0'),
         StringStruct(u'InternalName', u'API-Monitor'),
-        StringStruct(u'LegalCopyright', u'Copyright (c) 2026'),
+        StringStruct(u'LegalCopyright', u'Copyright (c) 2026 249469326i-lang'),
         StringStruct(u'OriginalFilename', u'API-Monitor.exe'),
         StringStruct(u'ProductName', u'API Monitor'),
         StringStruct(u'ProductVersion', u'3.0.0'),
