@@ -30,7 +30,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 APP_REPO = "https://github.com/249469326i-lang/api-monitor"
 
 WINDOW_WIDTH = 1200

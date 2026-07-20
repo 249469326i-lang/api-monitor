@@ -40,7 +40,7 @@ if exist "dist\API-Monitor.exe" (
     echo Build SUCCESS!
     echo.
     echo ========================================
-    echo API Monitor v3.0.0
+    echo API Monitor v3.0.1
     echo ========================================
     echo.
     echo Starting new version...
