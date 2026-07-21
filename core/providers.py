@@ -447,13 +447,51 @@ def _key_fingerprint(api_key: str) -> str:
     return f"{head}:{digest}"
 
 
-def auto_detect_current_provider() -> Dict[str, Any]:
+def _host_from_endpoint(endpoint: str) -> str:
+    """从 endpoint 提取 host,用于自动命名供应商。"""
+    from urllib.parse import urlparse
+    raw = (endpoint or "").strip()
+    if not raw:
+        return "claude"
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        host = (urlparse(raw).netloc or "").split("@")[-1].split(":")[0].strip().lower()
+    except Exception:
+        host = ""
+    return host or "claude"
+
+
+def _unique_provider_name(base: str) -> str:
+    """避免重名: base, base (2), base (3)..."""
+    names = {p.get("name") or "" for p in db.get_providers()}
+    if base not in names:
+        return base
+    i = 2
+    while f"{base} ({i})" in names:
+        i += 1
+    return f"{base} ({i})"
+
+
+def _mark_provider_current(provider_id: int) -> None:
+    """把指定供应商标为当前,其余标备用。"""
+    try:
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE providers SET role='备用'")
+            cursor.execute("UPDATE providers SET role='当前' WHERE id=?", (provider_id,))
+    except Exception:
+        pass
+
+
+def auto_detect_current_provider(force: bool = False) -> Dict[str, Any]:
     """
-    启动时检测 Claude Code 当前生效配置:
-    - 若库中已有 URL 匹配的 provider,不新增(交给 sync_current_from_settings 标记当前)。
-    - 若 URL 未命中但 api key 指纹命中已有 provider,更新该 provider 的 endpoint/model。
-    - 若 URL 和 key 指纹都未命中,且与上次同步指纹不同,新增一条 provider。
-    用指纹(last_synced_claude_fingerprint)实现"配置真变了才动"。
+    检测 Claude Code 当前生效配置,并与本库供应商对比:
+    - URL 匹配: 视为同一供应商,必要时更新 key/model,标为当前(不新建)。
+    - URL 未命中但 api key 指纹命中: 更新该 provider 的 endpoint/model。
+    - URL 与 key 都未命中: 新建一条供应商,写入当前配置。
+    force=False(启动默认): 指纹与上次相同则跳过,避免重复写入。
+    force=True(手动导入): 忽略指纹跳过,始终比对并返回可读 message。
     """
     from . import validators
 
@@ -463,71 +501,171 @@ def auto_detect_current_provider() -> Dict[str, Any]:
     model = cfg.get("model") or ""
 
     if not endpoint:
-        return {"success": False, "reason": "无可同步的端点"}
+        return {
+            "success": False,
+            "action": "error",
+            "reason": "无可同步的端点",
+            "error": "未检测到 Claude Code 配置(无 ANTHROPIC_BASE_URL)。请检查 ~/.claude/settings.json 的 env 块。",
+            "message": "未检测到 Claude Code 配置(无 ANTHROPIC_BASE_URL)",
+        }
 
     # 归一化 base_url(去尾 /v1 与斜杠),用于匹配与指纹
-    norm_endpoint = _get_claude_base_url(endpoint).rstrip("/").lower()
+    store_endpoint = _get_claude_base_url(endpoint)
+    norm_endpoint = store_endpoint.rstrip("/").lower()
     key_fp = _key_fingerprint(api_key)
     current_fingerprint = f"{norm_endpoint}|{model}|{key_fp}"
 
-    # 指纹与上次相同则完全跳过(配置未变)
+    # 指纹与上次相同则完全跳过(配置未变)——仅自动同步路径
     last_fp = db.get_setting("last_synced_claude_fingerprint") or ""
-    if last_fp == current_fingerprint:
-        return {"success": True, "reason": "配置未变,跳过", "fingerprint": current_fingerprint}
+    if not force and last_fp == current_fingerprint:
+        return {
+            "success": True,
+            "action": "skipped",
+            "reason": "配置未变,跳过",
+            "message": "Claude Code 配置未变化,已跳过",
+            "fingerprint": current_fingerprint,
+        }
 
     try:
-        providers = db.get_providers()
-        url_match_id = None
-        key_match_id = None
-        for p in providers:
+        all_providers = db.get_providers()
+        url_match = None
+        key_match = None
+        for p in all_providers:
             p_url = (p.get("endpoint") or "").rstrip("/").lower()
-            p_norm = _get_claude_base_url(p_url).rstrip("/") if p_url else ""
+            p_norm = _get_claude_base_url(p_url).rstrip("/").lower() if p_url else ""
             if p_norm == norm_endpoint:
-                url_match_id = p["id"]
+                url_match = p
                 break
-            # URL 未命中时再比 key 指纹
-            if key_fp and _key_fingerprint(p.get("api_key") or "") == key_fp:
-                key_match_id = p["id"]
+            if key_fp and key_match is None and _key_fingerprint(p.get("api_key") or "") == key_fp:
+                key_match = p
 
-        # URL 命中:不新增,只刷新指纹
-        if url_match_id:
+        # URL 命中: 同一供应商,更新差异字段并标当前
+        if url_match:
+            pid = url_match["id"]
+            update_data: Dict[str, Any] = {}
+            if api_key and _key_fingerprint(api_key) != _key_fingerprint(url_match.get("api_key") or ""):
+                update_data["api_key"] = api_key
+            if model and model != (url_match.get("default_model") or ""):
+                update_data["default_model"] = model
+            # 存储统一去 /v1 的 base,与 set_current_provider 一致
+            existing_norm = _get_claude_base_url(url_match.get("endpoint") or "").rstrip("/")
+            if existing_norm != store_endpoint:
+                update_data["endpoint"] = store_endpoint
+
+            changed = False
+            if update_data:
+                ok, err = validators.validate_provider(update_data, is_update=True)
+                if not ok:
+                    return {
+                        "success": False,
+                        "action": "error",
+                        "reason": f"校验失败: {err}",
+                        "error": err,
+                        "message": f"更新供应商失败: {err}",
+                    }
+                db.update_provider(pid, update_data)
+                changed = True
+
+            _mark_provider_current(pid)
             db.set_setting("last_synced_claude_fingerprint", current_fingerprint)
-            return {"success": True, "reason": "URL 已存在,未新增", "provider_id": url_match_id}
+            name = url_match.get("name") or str(pid)
+            if changed:
+                msg = f"已匹配供应商「{name}」并同步 key/模型,标为当前"
+                action = "updated"
+            else:
+                msg = f"配置已存在于供应商「{name}」,已标为当前"
+                action = "exists"
+            return {
+                "success": True,
+                "action": action,
+                "reason": "URL 已存在",
+                "message": msg,
+                "provider_id": pid,
+                "fingerprint": current_fingerprint,
+            }
 
-        # key 指纹命中:换端点但同一 key,更新已有 provider
-        if key_match_id:
-            update_data = {"endpoint": endpoint}
+        # key 指纹命中: 换端点但同一 key,更新已有 provider
+        if key_match:
+            pid = key_match["id"]
+            update_data = {"endpoint": store_endpoint}
             if model:
                 update_data["default_model"] = model
+            if api_key:
+                update_data["api_key"] = api_key
             ok, err = validators.validate_provider(update_data, is_update=True)
             if not ok:
-                return {"success": False, "reason": f"校验失败: {err}"}
-            db.update_provider(key_match_id, update_data)
+                return {
+                    "success": False,
+                    "action": "error",
+                    "reason": f"校验失败: {err}",
+                    "error": err,
+                    "message": f"更新供应商失败: {err}",
+                }
+            db.update_provider(pid, update_data)
+            _mark_provider_current(pid)
             db.set_setting("last_synced_claude_fingerprint", current_fingerprint)
-            return {"success": True, "reason": "key 指纹命中,已更新端点", "provider_id": key_match_id}
+            name = key_match.get("name") or str(pid)
+            return {
+                "success": True,
+                "action": "updated",
+                "reason": "key 指纹命中,已更新端点",
+                "message": f"已根据同一 API Key 更新供应商「{name}」的端点",
+                "provider_id": pid,
+                "fingerprint": current_fingerprint,
+            }
 
-        # 都未命中:新增
+        # 都未命中: 新建
         today = datetime.date.today().isoformat()
+        host = _host_from_endpoint(store_endpoint)
+        base_name = f"Claude · {host}"
         provider_data = {
-            "name": "Claude Code (current)",
+            "name": _unique_provider_name(base_name),
             "app_type": "claude",
             "role": "当前",
-            "endpoint": endpoint,
+            "endpoint": store_endpoint,
             "api_key": api_key,
             "default_model": model,
             "api_format": "anthropic_messages",
-            "notes": f"自动同步自 Claude Code 运行时配置 ({today})",
+            "notes": f"同步自 Claude Code 当前配置 ({today})",
             "status": "pending",
         }
         ok, err = validators.validate_provider(provider_data, is_update=False)
         if not ok:
-            return {"success": False, "reason": f"校验失败: {err}"}
+            return {
+                "success": False,
+                "action": "error",
+                "reason": f"校验失败: {err}",
+                "error": err,
+                "message": f"新建供应商失败: {err}",
+            }
         new_id = db.add_provider(provider_data)
+        _mark_provider_current(new_id)
         db.set_setting("last_synced_claude_fingerprint", current_fingerprint)
-        return {"success": True, "reason": "新增供应商", "provider_id": new_id}
+        return {
+            "success": True,
+            "action": "created",
+            "reason": "新增供应商",
+            "message": f"已新建供应商「{provider_data['name']}」并导入当前 Claude Code 配置",
+            "provider_id": new_id,
+            "fingerprint": current_fingerprint,
+        }
 
     except Exception as e:
-        return {"success": False, "reason": f"异常: {e}"}
+        return {
+            "success": False,
+            "action": "error",
+            "reason": f"异常: {e}",
+            "error": str(e),
+            "message": f"同步失败: {e}",
+        }
+
+
+def sync_claude_code_provider(force: bool = True) -> Dict[str, Any]:
+    """
+    导入入口: 主动读取 Claude Code 当前配置,与已有供应商对比,
+    不同则新建,相同则标记/更新。默认 force=True(手动导入不跳过)。
+    """
+    return auto_detect_current_provider(force=force)
 
 
 def _format_provider(p: Dict) -> Dict[str, Any]:

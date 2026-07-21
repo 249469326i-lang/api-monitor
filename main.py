@@ -5,6 +5,8 @@ v3.0.0 - 商业增值功能
 """
 
 import os
+import re
+from pathlib import Path
 import sys
 import threading
 import time
@@ -30,7 +32,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-__version__ = "3.0.1"
+__version__ = "3.0.2"
 APP_REPO = "https://github.com/249469326i-lang/api-monitor"
 
 WINDOW_WIDTH = 1200
@@ -699,8 +701,31 @@ class API:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def sync_claude_code_provider(self):
+        """从 Claude Code 当前配置同步/导入供应商(主导入路径)"""
+        try:
+            result = providers.sync_claude_code_provider(force=True)
+            # 同步 role 标记后,再按 settings 二次校准当前
+            try:
+                providers.sync_current_from_settings()
+            except Exception:
+                pass
+            if result.get("success"):
+                logger.info(
+                    "Sync Claude Code provider: action=%s provider_id=%s",
+                    result.get("action"),
+                    result.get("provider_id"),
+                )
+                self._refresh_frontend()
+            else:
+                logger.warning("Sync Claude Code provider failed: %s", result.get("error") or result.get("reason"))
+            return result
+        except Exception as e:
+            logger.exception("sync_claude_code_provider failed")
+            return {"success": False, "action": "error", "error": str(e), "message": f"同步失败: {e}"}
+
     def import_from_ccswitch(self):
-        """Import from cc-switch"""
+        """Import from cc-switch (secondary / advanced path)"""
         result = providers.import_from_ccswitch()
         if result.get("success"):
             logger.info(f"Import from cc-switch: {result.get('imported', 0)} imported, {result.get('skipped', 0)} skipped")
@@ -1222,6 +1247,14 @@ def main():
 
     web_path = os.path.join(base_path, 'web')
     html_path = os.path.join(web_path, 'index.html')
+    if not os.path.isfile(html_path):
+        logger.error(f"Frontend not found: {html_path}")
+        raise FileNotFoundError(f"Frontend not found: {html_path}")
+    # 用 file:// 加载；不要用 html=（WebView2 下 css/js 相对路径会失效导致无样式）
+    # 注意：WebView2 的 file:// 不支持 URL query（?v=...），附加后会 ERR_FILE_NOT_FOUND
+    # 前端缓存刷新请改 index.html 内 css/js 的 ?v= 版本号
+    html_url = Path(html_path).resolve().as_uri()
+    logger.info(f"Loading UI: {html_url}")
 
     api = API()
 
@@ -1229,14 +1262,14 @@ def main():
 
     window = webview.create_window(
         f'API Monitor v{__version__}',
-        html_path,
+        html_url,
         js_api=api,
         width=WINDOW_WIDTH,
         height=WINDOW_HEIGHT,
         x=x,
         y=y,
         min_size=(900, 580),
-        background_color='#f0f4f8',
+        background_color='#12141f',
         text_select=True,
         frameless=True,
         easy_drag=False,
@@ -1263,10 +1296,35 @@ def main():
         # 原有居中逻辑
         center_window(window)
 
+    # 独立存储目录，避免沿用旧 WebView2 缓存导致前端文案不更新
+    storage_path = os.path.join(
+        os.environ.get('APPDATA', ''),
+        '.cc-switch-monitor',
+        'webview2',
+    )
     try:
-        webview.start(_on_started, debug=False)
+        os.makedirs(storage_path, exist_ok=True)
     except Exception:
-        webview.start(_on_started, gui="mshtml", debug=False)
+        storage_path = None
+
+    try:
+        webview.start(
+            _on_started,
+            debug=False,
+            private_mode=True,
+            storage_path=storage_path,
+        )
+    except TypeError:
+        # 旧版 pywebview 不支持 storage_path
+        try:
+            webview.start(_on_started, debug=False, private_mode=True)
+        except Exception:
+            webview.start(_on_started, gui="mshtml", debug=False)
+    except Exception:
+        try:
+            webview.start(_on_started, gui="mshtml", debug=False)
+        except Exception:
+            raise
 
 
 if __name__ == '__main__':

@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="css/style.css?v=20260718-pixel-final">
+    <link rel="stylesheet" href="css/style.css?v=20260721-ui-fix">
 </head>
 <body>
     <div class="app">
@@ -174,7 +174,7 @@
                         <div class="tb-sep"></div>
                         <button class="tb-btn" id="refreshBtn" title="刷新">刷新</button>
                         <button class="tb-btn" id="addBtn" title="新增">+ 新增</button>
-                        <button class="tb-btn" id="importBtn" title="导入">导入</button>
+                        <button class="tb-btn" id="importBtn" title="同步当前 Claude Code 配置到供应商列表">同步</button>
                         <div class="toolbar-right">
                             <button class="tb-btn" id="selectModeBtn" title="多选">选择</button>
                         </div>
@@ -246,7 +246,7 @@
                                 <p>PICK LEFT LIST · VIEW TEST / TREND / CLI</p>
                                 <div class="empty-actions">
                                     <button type="button" class="tb-btn tb-cta" id="emptyAddBtn">+ ADD</button>
-                                    <button type="button" class="tb-btn" id="emptyImportBtn">IMPORT</button>
+                                    <button type="button" class="tb-btn" id="emptyImportBtn">SYNC CC</button>
                                     <button type="button" class="tb-btn" id="emptyTestBtn">⚡ TEST</button>
                                 </div>
                                 <div class="empty-cli mono" id="emptyCliPreview" aria-hidden="true">
@@ -257,7 +257,7 @@
                                 </div>
                                 <div class="empty-hint" id="emptyHint" style="display:none;">
                                     还没有提供商，点击 <a href="#" id="emptyAddLink">新增</a> 或
-                                    <a href="#" id="emptyImportLink">从 cc-switch 导入</a>
+                                    <a href="#" id="emptyImportLink">同步 Claude Code 配置</a>
                                 </div>
                             </div>
                         </div>
@@ -590,6 +590,6 @@
     <!-- ============ Toast ============ -->
     <div class="toast" id="toast"></div>
 
-    <script src="js/app.js?v=20260718-basic-order1"></script>
+    <script src="js/app.js?v=20260721-ui-fix"></script>
 </body>
 </html>

@@ -168,7 +168,7 @@ class App {
         // Provider list card actions
         document.getElementById('fastTestBtn')?.addEventListener('click', () => this.testAll('fast'));
         document.getElementById('refreshBtn')?.addEventListener('click', () => this.loadData());
-        document.getElementById('importBtn')?.addEventListener('click', () => this.importFromCCSwitch());
+        document.getElementById('importBtn')?.addEventListener('click', () => this.importFromClaudeCode());
         document.getElementById('addBtn')?.addEventListener('click', () => this.openAddModal());
         document.getElementById('launchBtn')?.addEventListener('click', () => this.launchClaude());
         document.getElementById('selectModeBtn')?.addEventListener('click', () => this.toggleSelectionMode());
@@ -227,10 +227,10 @@ class App {
         });
         document.getElementById('emptyImportLink')?.addEventListener('click', (e) => {
             e.preventDefault();
-            this.importFromCCSwitch();
+            this.importFromClaudeCode();
         });
         document.getElementById('emptyAddBtn')?.addEventListener('click', () => this.openAddModal());
-        document.getElementById('emptyImportBtn')?.addEventListener('click', () => this.importFromCCSwitch());
+        document.getElementById('emptyImportBtn')?.addEventListener('click', () => this.importFromClaudeCode());
         document.getElementById('emptyTestBtn')?.addEventListener('click', () => this.testAll('fast'));
         document.getElementById('bgResetBtn')?.addEventListener('click', () => this.resetSceneBackgrounds());
         document.getElementById('bgPreviewBtn')?.addEventListener('click', () => {
@@ -1429,10 +1429,43 @@ class App {
     }
 
     /* ------------------------------ Actions ---------------------------- */
+    async importFromClaudeCode() {
+        const ok = await this.showConfirm(
+            '将读取当前 Claude Code 生效配置（~/.claude/settings.json 与环境变量），并与已有供应商对比：\n• 相同配置 → 标为「当前」\n• 不同配置 → 自动新建供应商并写入当前配置',
+            '同步 Claude Code 配置',
+            '开始同步',
+            'primary'
+        );
+        if (!ok) return;
+        try {
+            const backend = this.backend();
+            if (!backend.sync_claude_code_provider) {
+                this.toast('当前版本后端不支持同步 Claude Code，请重新安装最新 exe', 'error');
+                return;
+            }
+            const result = await backend.sync_claude_code_provider();
+            if (result?.success) {
+                await this.loadData(false);
+                const action = result.action || '';
+                const level = (action === 'created' || action === 'updated') ? 'success' : 'info';
+                this.toast(result.message || '同步完成', level);
+                if (result.provider_id != null) {
+                    this.selectProvider(String(result.provider_id));
+                }
+                return;
+            }
+            this.toast(result?.error || result?.message || '同步失败', 'error');
+        } catch (error) {
+            console.error('Sync Claude Code failed:', error);
+            this.toast('同步失败: ' + (error?.message || error), 'error');
+        }
+    }
+
     async importFromCCSwitch() {
+        // 次要路径: 从 cc-switch / 本地 .db 导入
         const ok = await this.showConfirm(
             '将从 cc-switch 数据库导入供应商配置，已存在的同名供应商将被跳过。确定继续？',
-            '导入供应商',
+            '从 cc-switch 导入',
             '确认导入',
             'primary'
         );
@@ -2802,6 +2835,16 @@ class MockBackend {
         return {
             success: true,
             models: modelsByFormat[api_format] || modelsByFormat.anthropic_messages,
+        };
+    }
+
+    async sync_claude_code_provider() {
+        // 浏览器预览:模拟读取本地 Claude 配置
+        return {
+            success: false,
+            action: 'error',
+            error: '浏览器预览模式无法读取 Claude Code 配置',
+            message: '浏览器预览模式无法读取 Claude Code 配置,请运行桌面版 exe',
         };
     }
 
