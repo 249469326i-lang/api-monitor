@@ -7,7 +7,7 @@
 会更新:
     main.py               __version__
     file_version_info.txt filevers / prodvers / FileVersion / ProductVersion
-    rebuild.bat           构建成功提示中的版本号
+    (rebuild.bat 的版本提示已改为运行时从 main.py 读取，无需更新)
 
 漏改 main.py 的 __version__ 会导致自动更新用旧版本比较，用户永远收不到
 更新提示，因此发版时必须使用本脚本而不是手动逐处修改。
@@ -38,7 +38,6 @@ def main() -> None:
     _replace(root / "file_version_info.txt", r"prodvers=\(\d+, \d+, \d+, \d+\)", f"prodvers={ver_tuple}")
     _replace(root / "file_version_info.txt", r"(StringStruct\(u'FileVersion', u')[^']+(')", rf"\g<1>{new}\g<2>")
     _replace(root / "file_version_info.txt", r"(StringStruct\(u'ProductVersion', u')[^']+(')", rf"\g<1>{new}\g<2>")
-    _replace(root / "rebuild.bat", r"echo API Monitor v\d+\.\d+\.\d+", f"echo API Monitor v{new}")
 
     print(f"\n版本号已统一更新为 {new}")
     print("接下来: rebuild.bat 构建 -> 提交 -> 新建 GitHub Release (tag v" + new + ") 并上传 exe")

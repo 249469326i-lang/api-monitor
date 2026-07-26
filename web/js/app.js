@@ -198,7 +198,6 @@ class App {
 
         // Metric card buttons
         document.getElementById('mcFullTestBtn')?.addEventListener('click', () => this.testAll('full'));
-        document.getElementById('mcSettings')?.addEventListener('click', () => this.openSettings());
         document.getElementById('stopBtn')?.addEventListener('click', () => this.stopTesting());
 
         // Provider list card actions
@@ -282,6 +281,11 @@ class App {
         });
         // Scene backgrounds (defaults + local custom URLs)
         this.applySceneBackgrounds(this.loadSceneBackgrounds());
+        // 桌面版 private_mode 下 localStorage 可能不持久：
+        // 后端就绪后用 bg_* 设置覆盖（后端是持久可信来源）
+        window.addEventListener('pywebviewready', () => {
+            setTimeout(() => this._applyBackendSceneBackgrounds(), 300);
+        });
 
         // Notification bell
         document.getElementById('notifBtn')?.addEventListener('click', () => this.toggleNotifDropdown());
@@ -327,6 +331,20 @@ class App {
         document.querySelectorAll('.custom-select').forEach(sel => {
             const display = sel.querySelector('.custom-select-display');
             const dropdown = sel.querySelector('.custom-select-dropdown');
+            const options = Array.from(dropdown.querySelectorAll('.custom-select-option'));
+
+            // 键盘可达性：div 结构补 tabindex/role/键盘操作
+            display.setAttribute('tabindex', '0');
+            display.setAttribute('role', 'combobox');
+            display.setAttribute('aria-haspopup', 'listbox');
+            display.setAttribute('aria-expanded', 'false');
+            dropdown.setAttribute('role', 'listbox');
+            options.forEach(o => o.setAttribute('role', 'option'));
+
+            const setOpen = (open) => {
+                sel.classList.toggle('open', open);
+                display.setAttribute('aria-expanded', open ? 'true' : 'false');
+            };
 
             // Toggle dropdown on click
             display.addEventListener('click', (e) => {
@@ -335,23 +353,45 @@ class App {
                 document.querySelectorAll('.custom-select.open').forEach(other => {
                     if (other !== sel) other.classList.remove('open');
                 });
-                sel.classList.toggle('open');
+                setOpen(!sel.classList.contains('open'));
+            });
+
+            // 键盘操作：Enter/Space 开合，↑↓ 移动选择，Esc 关闭
+            display.addEventListener('keydown', (e) => {
+                const isOpen = sel.classList.contains('open');
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setOpen(!isOpen);
+                } else if (e.key === 'Escape' && isOpen) {
+                    e.preventDefault();
+                    setOpen(false);
+                } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    const cur = options.findIndex(o => o.dataset.value === sel.dataset.value);
+                    const dir = e.key === 'ArrowDown' ? 1 : -1;
+                    const next = Math.min(options.length - 1, Math.max(0, (cur < 0 ? 0 : cur + dir)));
+                    const opt = options[next];
+                    if (opt) this._setCustomSelectValue(sel.id, opt.dataset.value);
+                }
             });
 
             // Select option
-            dropdown.querySelectorAll('.custom-select-option').forEach(opt => {
+            options.forEach(opt => {
                 opt.addEventListener('click', (e) => {
                     e.stopPropagation();
                     const val = opt.dataset.value;
                     this._setCustomSelectValue(sel.id, val);
-                    sel.classList.remove('open');
+                    setOpen(false);
                 });
             });
         });
 
         // Close custom selects when clicking outside
         document.addEventListener('click', () => {
-            document.querySelectorAll('.custom-select.open').forEach(s => s.classList.remove('open'));
+            document.querySelectorAll('.custom-select.open').forEach(s => {
+                s.classList.remove('open');
+                s.querySelector('.custom-select-display')?.setAttribute('aria-expanded', 'false');
+            });
         });
     }
 
@@ -639,8 +679,14 @@ class App {
             this.renderProviders(this.filteredProviders, animate);
             this.updateProviderCount(this.filteredProviders.length);
             this.toggleEmptyHint(providers.length === 0);
+            this._loadDataFailed = false;
         } catch (error) {
             console.error('Failed to load data:', error);
+            // 只提示一次，避免后端持续不可用时 toast 刷屏
+            if (!this._loadDataFailed) {
+                this._loadDataFailed = true;
+                this.toast('后端连接失败，数据可能不是最新', 'error');
+            }
         }
     }
 
@@ -844,13 +890,15 @@ class App {
 
     _highlight(text, keywords) {
         if (!keywords || !keywords.length || !text) return this.escape(text);
-        let escaped = this.escape(text);
-        for (const kw of keywords) {
-            if (!kw) continue;
-            const re = new RegExp(`(${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
-            escaped = escaped.replace(re, '<mark>$1</mark>');
-        }
-        return escaped;
+        // 先按关键词分段、再对每段单独转义：不能在转义后的串上做替换，
+        // 否则搜 "amp"/"lt" 会命中 &amp; 等实体内部产生乱码
+        const valid = keywords.filter(Boolean);
+        if (!valid.length) return this.escape(text);
+        const pattern = valid.map(kw => kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+        const re = new RegExp(`(${pattern})`, 'gi');
+        return String(text).split(re).map((seg, i) =>
+            i % 2 === 1 ? `<mark>${this.escape(seg)}</mark>` : this.escape(seg)
+        ).join('');
     }
 
     _latencyClass(latencyStr) {
@@ -989,27 +1037,8 @@ class App {
         set('mcTotal', total);
         set('mcOk', ok);
         set('mcFail', fail);
+        // 平均延迟等指标统一由 _applyMetricVisuals 更新，不再重复计算
         this._applyMetricVisuals(total, ok, fail);
-
-        // Average latency (legacy hidden fields still updated inside _applyMetricVisuals)
-        let avgLatency = 0;
-        let latencyCount = 0;
-        for (const p of this.providers) {
-            const num = this._latencyNum(p.latency);
-            if (num < 999999) {
-                avgLatency += num;
-                latencyCount++;
-            }
-        }
-        const avg = latencyCount > 0 ? Math.round(avgLatency / latencyCount) : null;
-        set('mcAvgLatency', avg != null ? `${avg}ms` : '--');
-
-        const mcLatencyValue = document.getElementById('mcLatencyValue');
-        if (mcLatencyValue) {
-            mcLatencyValue.innerHTML = avg != null
-                ? `${avg}<span class="mc-unit">ms</span>`
-                : `--<span class="mc-unit">ms</span>`;
-        }
     }
 
     addCliLog(level, text, name) {
@@ -2191,6 +2220,26 @@ class App {
         };
     }
 
+    async _applyBackendSceneBackgrounds() {
+        try {
+            const r = await this.backend().get_all_settings();
+            const s = r?.success ? r.data : null;
+            if (!s) return;
+            const hasAny = s.bg_rate || s.bg_nodes || s.bg_ok || s.bg_err || s.bg_detail;
+            if (!hasAny) return;
+            const defaults = this.defaultSceneBackgrounds();
+            const scene = {
+                rate: s.bg_rate || defaults.rate,
+                nodes: s.bg_nodes || defaults.nodes,
+                ok: s.bg_ok || defaults.ok,
+                err: s.bg_err || defaults.err,
+                detail: s.bg_detail || defaults.detail,
+            };
+            this.saveSceneBackgrounds(scene);
+            this.applySceneBackgrounds(scene);
+        } catch { /* 后端不可用时保持 localStorage 值 */ }
+    }
+
     loadSceneBackgrounds() {
         const defaults = this.defaultSceneBackgrounds();
         try {
@@ -2385,8 +2434,17 @@ class App {
         const canvas = document.getElementById('trendCanvas');
         if (!canvas) return;
         const ctx = canvas.getContext('2d');
-        const W = canvas.width;
-        const H = canvas.height;
+        // 按容器实际宽度 × DPR 设置位图尺寸，避免 CSS 拉伸导致线条发虚
+        const dpr = window.devicePixelRatio || 1;
+        const cssW = canvas.parentElement?.clientWidth || canvas.clientWidth || 600;
+        const cssH = 160;
+        canvas.width = Math.round(cssW * dpr);
+        canvas.height = Math.round(cssH * dpr);
+        canvas.style.width = cssW + 'px';
+        canvas.style.height = cssH + 'px';
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        const W = cssW;
+        const H = cssH;
 
         ctx.clearRect(0, 0, W, H);
 
@@ -2487,26 +2545,46 @@ class App {
 
     updateSchedulerStatus(status) {
         if (!status) return;
-        const chip = document.getElementById('statusScheduler');
-        const val = document.getElementById('statusSchedulerVal') || chip;
-        if (chip && val) {
-            if (status.running && status.interval > 0) {
-                const rem = Math.max(0, parseInt(status.remaining || 0, 10));
-                const mm = String(Math.floor(rem / 60)).padStart(2, '0');
-                const ss = String(rem % 60).padStart(2, '0');
-                const intervalMin = Math.max(1, Math.round((status.interval || 0) / 60));
-                val.textContent = `${mm}:${ss} /${intervalMin}M`;
-                chip.classList.add('is-running');
-                chip.classList.remove('is-off');
-                chip.title = `定时测试：${mm}:${ss} 后下一次 · 每 ${intervalMin} 分钟`;
-            } else {
-                val.textContent = 'OFF';
-                chip.classList.remove('is-running');
-                chip.classList.add('is-off');
-                chip.title = '定时测试：关闭';
+        // 后端只在状态变化时推送；倒计时由本地每秒根据 next_run 自减渲染
+        this._schedulerState = status;
+        this._renderSchedulerChip();
+        if (status.running && status.interval > 0) {
+            if (!this._schedulerTicker) {
+                this._schedulerTicker = setInterval(() => {
+                    if (!document.hidden) this._renderSchedulerChip();
+                }, 1000);
             }
+        } else if (this._schedulerTicker) {
+            clearInterval(this._schedulerTicker);
+            this._schedulerTicker = null;
         }
         if (status.failover) this.updateFailoverStatus(status.failover);
+    }
+
+    _renderSchedulerChip() {
+        const status = this._schedulerState;
+        if (!status) return;
+        const chip = document.getElementById('statusScheduler');
+        const val = document.getElementById('statusSchedulerVal') || chip;
+        if (!chip || !val) return;
+        if (status.running && status.interval > 0) {
+            // 优先用 next_run 现算，避免依赖推送时刻的 remaining 快照
+            const rem = status.next_run
+                ? Math.max(0, Math.floor(status.next_run - Date.now() / 1000))
+                : Math.max(0, parseInt(status.remaining || 0, 10));
+            const mm = String(Math.floor(rem / 60)).padStart(2, '0');
+            const ss = String(rem % 60).padStart(2, '0');
+            const intervalMin = Math.max(1, Math.round((status.interval || 0) / 60));
+            val.textContent = `${mm}:${ss} /${intervalMin}M`;
+            chip.classList.add('is-running');
+            chip.classList.remove('is-off');
+            chip.title = `定时测试：${mm}:${ss} 后下一次 · 每 ${intervalMin} 分钟`;
+        } else {
+            val.textContent = 'OFF';
+            chip.classList.remove('is-running');
+            chip.classList.add('is-off');
+            chip.title = '定时测试：关闭';
+        }
     }
 
     updateFailoverStatus(fo) {

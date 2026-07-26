@@ -105,7 +105,12 @@ class Scheduler:
         }
 
     def _run_loop(self):
-        """定时器主循环"""
+        """定时器主循环
+
+        只在状态变化（触发测试、重新计时）时推送；倒计时由前端
+        根据 next_run 本地自减，不再每秒一次 evaluate_js 桥接。
+        """
+        last_pushed_next_run = 0
         while not self._stop_event.is_set():
             now = int(time.time())
             if now >= self._next_run:
@@ -117,7 +122,9 @@ class Scheduler:
                 # 计算下次执行时间
                 self._next_run = int(time.time()) + self._interval
 
-            self._push_status()
+            if self._next_run != last_pushed_next_run:
+                last_pushed_next_run = self._next_run
+                self._push_status()
             # 每秒检查一次
             self._stop_event.wait(1)
 

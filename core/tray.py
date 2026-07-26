@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
 from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _resource_path(*parts: str) -> str:
@@ -17,18 +20,21 @@ def _resource_path(*parts: str) -> str:
 
 
 def _load_icon():
-    """优先用 assets/icon.ico，否则生成简单图标。"""
+    """优先用应用图标文件，否则生成简单图标。"""
     try:
         from PIL import Image, ImageDraw
     except Exception:
         return None
 
-    ico = _resource_path("assets", "icon.ico")
-    if os.path.isfile(ico):
-        try:
-            return Image.open(ico)
-        except Exception:
-            pass
+    for candidate in (
+        _resource_path("cc_switch_icon.ico"),
+        _resource_path("assets", "icon.ico"),
+    ):
+        if os.path.isfile(candidate):
+            try:
+                return Image.open(candidate)
+            except Exception:
+                logger.warning(f"托盘图标加载失败: {candidate}", exc_info=True)
 
     # 简单生成：深色底 + 绿色圆点
     size = 64
@@ -65,12 +71,12 @@ class TrayController:
                 import pystray
                 from pystray import MenuItem as item
             except Exception as e:
-                print(f"[tray] pystray unavailable: {e}")
+                logger.warning(f"pystray 不可用: {e}")
                 return False
 
             image = _load_icon()
             if image is None:
-                print("[tray] no icon image available")
+                logger.warning("无可用托盘图标")
                 return False
 
             menu_items = [
@@ -93,7 +99,7 @@ class TrayController:
                 try:
                     icon.run()
                 except Exception as e:
-                    print(f"[tray] icon.run error: {e}")
+                    logger.warning(f"托盘 icon.run 异常: {e}")
                 finally:
                     with self._lock:
                         if self._icon is icon:
@@ -131,13 +137,13 @@ class TrayController:
         try:
             self._on_show()
         except Exception as e:
-            print(f"[tray] show error: {e}")
+            logger.warning(f"托盘显示窗口异常: {e}")
 
     def _handle_quit(self, icon=None, item=None):
         try:
             self._on_quit()
         except Exception as e:
-            print(f"[tray] quit error: {e}")
+            logger.warning(f"托盘退出异常: {e}")
 
     def _handle_quick_test(self, icon=None, item=None):
         if not self._on_quick_test:
@@ -145,4 +151,4 @@ class TrayController:
         try:
             self._on_quick_test()
         except Exception as e:
-            print(f"[tray] quick test error: {e}")
+            logger.warning(f"托盘快速测试异常: {e}")

@@ -121,29 +121,31 @@ def import_from_path(db_path: str) -> Dict[str, Any]:
         }
 
     try:
+        # try/finally 保证任何异常路径都关闭连接
         conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        table_names = {r[0] for r in cursor.fetchall()}
-
-        if "providers" not in table_names:
-            conn.close()
-            return {
-                "success": False,
-                "error": "数据库表结构不兼容 (未找到 providers 表)",
-                "imported": 0,
-            }
-
-        # 按 is_current desc, sort_index asc, id asc 排序 —— 让当前 provider 排第一
         try:
-            cursor.execute("SELECT * FROM providers ORDER BY is_current DESC, sort_index ASC, id ASC")
-        except sqlite3.OperationalError:
-            cursor.execute("SELECT * FROM providers ORDER BY id")
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
 
-        rows = cursor.fetchall()
-        conn.close()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            table_names = {r[0] for r in cursor.fetchall()}
+
+            if "providers" not in table_names:
+                return {
+                    "success": False,
+                    "error": "数据库表结构不兼容 (未找到 providers 表)",
+                    "imported": 0,
+                }
+
+            # 按 is_current desc, sort_index asc, id asc 排序 —— 让当前 provider 排第一
+            try:
+                cursor.execute("SELECT * FROM providers ORDER BY is_current DESC, sort_index ASC, id ASC")
+            except sqlite3.OperationalError:
+                cursor.execute("SELECT * FROM providers ORDER BY id")
+
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
 
         if not rows:
             return {

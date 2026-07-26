@@ -936,11 +936,13 @@ class API:
         return {"success": True, "message": f"已开始{mode}测试"}
 
     def stop_testing(self):
-        """Stop ongoing tests"""
+        """Stop ongoing tests
+
+        只置位停止信号立即返回，不 join：此方法在 JS 桥线程上执行，
+        join 会让「停止」按钮卡 UI 最长 5 秒（进行中的请求不可中断）。
+        测试线程看到信号后自行收尾并推送 testing_complete。
+        """
         self._stop_event.set()
-        # 等待测试线程优雅退出
-        if self._test_thread and self._test_thread.is_alive():
-            self._test_thread.join(timeout=5)
         with self._testing_lock:
             self._testing = False
         return {"success": True}
@@ -1437,7 +1439,8 @@ class API:
     def _refresh_frontend(self):
         if self._window:
             try:
-                self._window.evaluate_js("if (window.app) { window.app.loadData(); }")
+                # loadData(false)：CRUD 后刷新数据但不重放整表入场动画
+                self._window.evaluate_js("if (window.app) { window.app.loadData(false); }")
             except Exception as e:
                 logger.warning(f"Push refresh_frontend failed: {e}")
 
@@ -1514,7 +1517,12 @@ class API:
 
 
 def center_native_window(window):
-    hwnd = int(window.native.Handle.ToInt32())
+    # 64 位句柄高位非零时 ToInt32 会抛 OverflowException，优先 ToInt64
+    handle = window.native.Handle
+    try:
+        hwnd = int(handle.ToInt64())
+    except Exception:
+        hwnd = int(handle.ToInt32())
     rect = RECT()
     ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
 

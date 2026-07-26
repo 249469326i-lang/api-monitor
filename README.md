@@ -97,7 +97,7 @@ python -m pip install -r requirements-dev.txt
 rebuild.bat
 
 # 或者手动执行
-pyinstaller --noconfirm --clean CC-Switch-Monitor.spec
+pyinstaller --noconfirm --clean API-Monitor.spec
 ```
 
 产物为单文件 `API-Monitor.exe`（约 30–35 MB），已内置 `web/` 前端资源，可直接拷贝给没有 Python 环境的 Windows 机器使用。
@@ -113,7 +113,7 @@ api-monitor/
 ├── web/                    # 前端 UI（index.html / css / js / assets）
 ├── docs/                   # 设计文档、CODE_WIKI 与截图
 ├── .github/                # Issue / PR 模板
-├── CC-Switch-Monitor.spec  # PyInstaller 打包规格
+├── API-Monitor.spec  # PyInstaller 打包规格
 ├── rebuild.bat             # 一键重打包脚本
 ├── bump_version.py         # 发版时统一更新各处版本号
 ├── verify_backend.py       # 后端 API 冒烟验证脚本

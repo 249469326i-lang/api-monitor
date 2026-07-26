@@ -30,7 +30,7 @@ echo.
 REM Rebuild with PyInstaller
 echo [3/4] Building new executable...
 echo This may take 30-60 seconds...
-pyinstaller --noconfirm --clean CC-Switch-Monitor.spec
+pyinstaller --noconfirm --clean API-Monitor.spec
 echo.
 
 REM Move result
@@ -40,7 +40,8 @@ if exist "dist\API-Monitor.exe" (
     echo Build SUCCESS!
     echo.
     echo ========================================
-    echo API Monitor v3.0.2
+    REM 从 main.py 读取版本号，避免硬编码失同步
+    for /f "delims=" %%v in ('python -c "from main import __version__; print(__version__)" 2^>nul') do echo API Monitor v%%v
     echo ========================================
     echo.
     echo Starting new version...

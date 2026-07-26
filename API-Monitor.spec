@@ -19,9 +19,19 @@ if os.path.isdir(_web_dir):
         for _f in os.listdir(_bg_dir):
             if _f.lower().endswith(('.gif', '.png', '.webp')) and not _f.startswith('_'):
                 datas.append((os.path.join(_bg_dir, _f), 'web/assets/metric-bg'))
+    _fonts_dir = os.path.join(_web_dir, 'assets', 'fonts')
+    if os.path.isdir(_fonts_dir):
+        for _f in os.listdir(_fonts_dir):
+            if _f.lower().endswith('.woff2'):
+                datas.append((os.path.join(_fonts_dir, _f), 'web/assets/fonts'))
     print(f"[INFO] Adding whitelisted web assets from: {_web_dir}")
 else:
     print("[WARNING] web/ directory not found next to spec file!")
+
+# 托盘图标（core/tray.py 运行时从 _MEIPASS 根目录加载）
+_icon_file = os.path.join(_spec_dir, 'cc_switch_icon.ico')
+if os.path.isfile(_icon_file):
+    datas.append((_icon_file, '.'))
 
 a = Analysis(
     ['main.py'],
