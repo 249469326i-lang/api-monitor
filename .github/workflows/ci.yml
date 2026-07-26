@@ -9,6 +9,9 @@ jobs:
   test:
     # core 依赖 DPAPI / winreg，必须在 Windows 上跑
     runs-on: windows-latest
+    env:
+      # 脚本输出含中文，Windows runner 默认 cp1252 会 UnicodeEncodeError
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
 
