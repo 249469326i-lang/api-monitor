@@ -54,19 +54,37 @@ class App {
         setTimeout(tryConnect, 200);
         setTimeout(tryConnect, 800);
 
-        // 首次加载:立即用 MockBackend 展示 UI,不阻塞渲染
-        // pywebview 就绪后会用真实后端覆盖
-        this.loadData();
+        // 首次加载:若 pywebview 已就绪则直接用真实后端;
+        // 否则等待 1.5s（桌面版 api 注入是异步的），超时仍未就绪才
+        // 回退 MockBackend（浏览器预览场景）。
+        // 避免桌面版启动时闪现 Mock 假数据又被真实数据覆盖。
+        if (this.api) {
+            this.loadData();
+        } else {
+            setTimeout(() => {
+                if (!this.api) this.loadData();
+            }, 1500);
+        }
         setTimeout(() => this.initRuntimeStatus(), 1200);
 
         // 启动时静默检查更新（延迟 3 秒，不阻塞主流程）
         setTimeout(() => this._checkForUpdate(), 3000);
 
-        // 定时刷新调度器状态和未读数
+        // 兜底轮询调度器状态和未读数：后端有主动推送
+        // (_push_scheduler_tick/_push_unread_count)，这里 30s 低频兜底即可，
+        // 且窗口隐藏（托盘）时跳过，不白耗桥接调用
         setInterval(() => {
+            if (document.hidden) return;
             this._refreshSchedulerStatus();
             this._refreshUnreadCount();
-        }, 5000);
+        }, 30000);
+        // 从托盘恢复显示时立即刷新一次
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+                this._refreshSchedulerStatus();
+                this._refreshUnreadCount();
+            }
+        });
     }
 
     async _refreshUnreadCount() {
@@ -204,9 +222,16 @@ class App {
         document.getElementById('batchBackupBtn')?.addEventListener('click', () => this.batchSetBackup());
         document.getElementById('batchClearBtn')?.addEventListener('click', () => this.clearSelection());
 
-        // Search
+        // Search（120ms 防抖：每击键全表重建，节点多时会卡顿）
         document.getElementById('searchInput')?.addEventListener('input', (e) => {
-            this.filterProviders(e.target.value);
+            clearTimeout(this._searchDebounce);
+            this._searchDebounce = setTimeout(() => this.filterProviders(e.target.value), 120);
+        });
+
+        // 表单 API Key 显示/隐藏切换
+        document.getElementById('fApiKeyToggle')?.addEventListener('click', () => {
+            const input = document.getElementById('fApiKey');
+            if (input) input.type = input.type === 'password' ? 'text' : 'password';
         });
 
         // Detail card tabs (was .result-tab)
@@ -276,7 +301,7 @@ class App {
         document.getElementById('exportHistoryBtn')?.addEventListener('click', () => this.exportHistoryCsv());
         document.getElementById('backupBtn')?.addEventListener('click', () => this.backupDb());
         document.getElementById('restoreBtn')?.addEventListener('click', () => this.restoreDb());
-        document.getElementById('backupNowBtn')?.addEventListener('click', () => this.backupNow());
+        document.getElementById('backupNowBtn')?.addEventListener('click', () => this.backupDb());
         document.getElementById('failoverConfirmBtn')?.addEventListener('click', () => this.confirmFailover());
         document.getElementById('failoverCancelBtn')?.addEventListener('click', () => this.cancelFailover());
 
@@ -654,21 +679,19 @@ class App {
         if (content) content.insertBefore(banner, content.firstChild);
 
         document.getElementById('updateDownloadBtn')?.addEventListener('click', () => {
-            if (data.download_url) window.open(data.download_url, '_blank');
+            // 只打开 GitHub 域名的下载链接，防止更新元数据被篡改后跳转任意 URL
+            try {
+                const u = new URL(data.download_url);
+                if (u.protocol === 'https:' && (u.hostname === 'github.com' || u.hostname.endsWith('.github.com') || u.hostname === 'objects.githubusercontent.com')) {
+                    window.open(data.download_url, '_blank');
+                } else {
+                    this.toast('下载链接域名异常，已阻止打开', 'error');
+                }
+            } catch { /* 无效 URL 直接忽略 */ }
         });
         document.getElementById('updateDismissBtn')?.addEventListener('click', () => {
             banner.remove();
         });
-    }
-
-    getMockProviders() {
-        return [
-            { id: "1", name: "Lucky-api",   app_type: "claude", role: "当前", endpoint: "https://openrouter.ai/api/v1",    key: "sk-...abcd", status: "ok",      latency: "128ms", detail: "正常",     default_model: "claude-haiku-4-5", category: "主用", notes: "" },
-            { id: "2", name: "ShareGPT",     app_type: "claude", role: "备用", endpoint: "https://api.siliconflow.cn/v1",   key: "sk-...efgh", status: "ok",      latency: "89ms",  detail: "正常",     default_model: "", category: "", notes: "" },
-            { id: "3", name: "阿里",         app_type: "claude", role: "备用", endpoint: "https://api.aliyun.com/v1",      key: "sk-...ijkl", status: "fail",    latency: "-",     detail: "连接失败", default_model: "", category: "", notes: "" },
-            { id: "4", name: "ThatAPI",      app_type: "claude", role: "备用", endpoint: "https://api.thatapi.com/v1",     key: "sk-...mnop", status: "pending", latency: "-",     detail: "未测试",   default_model: "", category: "", notes: "" },
-            { id: "5", name: "GUPI",         app_type: "claude", role: "备用", endpoint: "https://api.gupi.com/v1",        key: "sk-...qrst", status: "pending", latency: "-",     detail: "未测试",   default_model: "", category: "", notes: "" },
-        ];
     }
 
     /* --------------------------- Stats render -------------------------- */
@@ -925,15 +948,22 @@ class App {
         if (!tbody) return;
         const existingRow = tbody.querySelector(`tr[data-id="${providerData.id}"]`);
         if (existingRow) {
-            const sc = this.statusClass(providerData.status);
-            const st = this.statusText(providerData.status);
+            const p = idx >= 0 ? this.providers[idx] : providerData;
+            const sc = this.statusClass(p.status);
+            const st = this.statusText(p.status);
+            // 同步行状态类（左侧彩色边框），与 renderProviders 保持一致
+            existingRow.classList.remove('row-ok', 'row-fail', 'row-testing');
+            if (sc === 'ok') existingRow.classList.add('row-ok');
+            else if (sc === 'fail') existingRow.classList.add('row-fail');
+            else if (sc === 'testing') existingRow.classList.add('row-testing');
+            existingRow.classList.toggle('row-current', p.role === '当前');
             const cells = existingRow.querySelectorAll('td');
             if (cells.length >= 6) {
-                // 名称 (index 1, 因为 0 是复选框)
-                cells[1].innerHTML = `<span class="plc-name">${this.escape(providerData.name || '')}</span>`;
+                // 名称 (index 1, 因为 0 是复选框)：复用整表渲染的模板（含插入符与搜索高亮）
+                cells[1].innerHTML = `<span class="plc-name"><span class="row-caret" aria-hidden="true">▶</span>${this._highlight(p.name || '', this._searchKeywords)}</span>`;
                 // 延迟 (index 4)
                 cells[4].classList.add('col-ping');
-                cells[4].innerHTML = this._pingCell(providerData.latency);
+                cells[4].innerHTML = this._pingCell(p.latency);
                 // 状态药丸 (index 5)
                 cells[5].innerHTML = `<span class="status-pill ${sc}">${this.statusIcon(sc)} ${st}</span>`;
             }
@@ -1867,15 +1897,17 @@ class App {
         this.pushLog('info', `开始批量测试 ${ids.length} 个提供商...`);
         for (const id of ids) {
             if (!this.isTesting) break;
+            // pushLog 第三参是供应商名（CLI 页签按名称过滤日志）
+            const pName = this.providers.find(p => String(p.id) === String(id))?.name || '';
             try {
                 const r = await this.backend().test_provider(id);
                 if (r?.success) {
-                    this.pushLog('ok', `OK · ${r.latency}ms`, r.detail || '');
+                    this.pushLog('ok', `OK · ${r.latency}ms · ${r.detail || ''}`, pName);
                 } else {
-                    this.pushLog('err', `失败 · ${r?.detail || '未知错误'}`, '');
+                    this.pushLog('err', `失败 · ${r?.detail || '未知错误'}`, pName);
                 }
             } catch (e) {
-                this.pushLog('err', `异常: ${e.message}`, '');
+                this.pushLog('err', `异常: ${e.message}`, pName);
             }
         }
         this.setTestingState(false);
@@ -2042,18 +2074,6 @@ class App {
             this.updateUnreadCount(0);
             await this.loadNotifications();
         } catch {}
-    }
-
-    onFailoverEvent(data) {
-        if (!data?.switched) return;
-        // Show failover banner
-        const banner = document.createElement('div');
-        banner.className = 'failover-banner';
-        banner.textContent = `⚡ 自动切换: ${data.from} → ${data.to}`;
-        document.body.appendChild(banner);
-        setTimeout(() => banner.remove(), 4000);
-        // Refresh data
-        this.loadData(false);
     }
 
     /* ========================= Settings ========================= */
@@ -2641,18 +2661,6 @@ class App {
             });
         } catch (e) {
             box.innerHTML = '<div class="backup-empty">无法读取备份列表</div>';
-        }
-    }
-
-    async backupNow() {
-        try {
-            const r = await this.backend().create_backup();
-            if (r?.success) {
-                this.toast('备份成功', 'success');
-                await this.refreshBackupList();
-            } else this.toast(r?.error || '备份失败', 'error');
-        } catch (e) {
-            this.toast('备份失败: ' + e.message, 'error');
         }
     }
 

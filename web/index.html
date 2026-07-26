@@ -342,7 +342,12 @@
                 </div>
                 <div class="form-row">
                     <label>API Key</label>
-                    <input type="text" id="fApiKey" placeholder="sk-...">
+                    <div class="api-key-input-wrap" style="position:relative;">
+                        <input type="password" id="fApiKey" placeholder="sk-..." autocomplete="off" style="padding-right:34px;">
+                        <button type="button" id="fApiKeyToggle" title="显示/隐藏" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:inherit;opacity:.6;padding:2px;">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                        </button>
+                    </div>
                 </div>
                 <div class="form-grid-2">
                     <div class="form-row" style="position:relative;">

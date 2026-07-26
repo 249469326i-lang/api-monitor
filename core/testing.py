@@ -20,9 +20,28 @@ from . import db
 logger = logging.getLogger(__name__)
 
 
+# 设置短 TTL 缓存：full 测试单个供应商会发几十个请求，
+# 每个请求读 2-3 个设置各建一次 DB 连接，批测时是几百次无谓开销
+_settings_cache: Dict[str, tuple] = {}
+_settings_cache_lock = threading.Lock()
+_SETTINGS_CACHE_TTL = 5.0
+
+
+def _cached_setting(key: str):
+    now = time.monotonic()
+    with _settings_cache_lock:
+        entry = _settings_cache.get(key)
+        if entry and now - entry[1] < _SETTINGS_CACHE_TTL:
+            return entry[0]
+    val = db.get_setting(key)
+    with _settings_cache_lock:
+        _settings_cache[key] = (val, now)
+    return val
+
+
 def _create_ssl_context() -> ssl.SSLContext:
     """创建 SSL 上下文，根据 ssl_verify 设置决定是否验证证书"""
-    verify = db.get_setting("ssl_verify")
+    verify = _cached_setting("ssl_verify")
     if verify == "1":
         return ssl.create_default_context()
     else:
@@ -35,7 +54,7 @@ def _create_ssl_context() -> ssl.SSLContext:
 def _get_timeout() -> int:
     """从设置中获取超时时间（秒）"""
     try:
-        return int(db.get_setting("test_timeout") or "30")
+        return int(_cached_setting("test_timeout") or "30")
     except (ValueError, TypeError):
         return 30
 
@@ -43,7 +62,7 @@ def _get_timeout() -> int:
 def _get_retries() -> int:
     """从设置中获取重试次数"""
     try:
-        return int(db.get_setting("test_retries") or "2")
+        return int(_cached_setting("test_retries") or "2")
     except (ValueError, TypeError):
         return 2
 
@@ -590,9 +609,12 @@ def test_provider(provider_id: int, mode: str = "fast", log_callback=None) -> Di
             if result.get("error") and not _looks_like_attempt_summary(result["error"]):
                 result["error"] = _normalize_error_text(result["error"]) or result["error"]
             last_result = result
-            # auth/quota/rate 不重试（重试也没用）
+            # auth/quota/rate 不重试（重试也没用）；连接类错误同理
             error_type = _classify_error(result.get("error", ""))
-            if error_type in ("auth_error", "rate_limited", "quota_error"):
+            if error_type in (
+                "auth_error", "rate_limited", "quota_error",
+                "dns_failure", "connection_refused", "network_unreachable",
+            ):
                 break
 
         except Exception as e:
@@ -916,6 +938,10 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
     auth_methods.append(("x-api-key", {"x-api-key": api_key}))
 
     attempt_errors = []
+    # 死端点短路：DNS 解析失败/连接拒绝/网络不可达意味着同一 host 的
+    # 所有格式×路径×认证组合都会失败，没必要按 30s 超时逐个耗完。
+    # 连续超时 2 次同样视为端点不可用。
+    _fatal = {"dead": False, "timeouts": 0}
 
     def _record_error(label: str, result: dict):
         err = (result or {}).get("error") or ""
@@ -929,6 +955,16 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
             err = _normalize_error_text(err) or err
         text = f"[{label}] {err}" if label else err
         attempt_errors.append(text)
+
+        etype = _classify_error(err)
+        if etype in ("dns_failure", "connection_refused", "network_unreachable"):
+            _fatal["dead"] = True
+        elif etype == "timeout":
+            _fatal["timeouts"] += 1
+            if _fatal["timeouts"] >= 2:
+                _fatal["dead"] = True
+        else:
+            _fatal["timeouts"] = 0
 
     def _model_candidates(default_model: str) -> list:
         candidates = []
@@ -948,6 +984,8 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
             body = {"model": claude_model, "max_tokens": 32, "messages": [{"role": "user", "content": "你是谁呀，小朋友"}]}
             for path in paths:
                 for auth_name, auth_h in auth_methods:
+                    if _fatal["dead"]:
+                        return None
                     url = f"{endpoint}/{path}"
                     headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
                     headers.update(auth_h)
@@ -987,6 +1025,8 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
                 stripped_base = f"{parsed.scheme}://{parsed.netloc}{stripped_path}".rstrip("/")
                 urls.append(f"{stripped_base}/v1/chat/completions")
         for url in urls:
+            if _fatal["dead"]:
+                return None
             headers = {"Content-Type": "application/json"}
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
@@ -1011,6 +1051,8 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
         if not endpoint.endswith("/v1"):
             paths.append("v1/responses")
         for path in paths:
+            if _fatal["dead"]:
+                return None
             url = f"{endpoint}/{path}"
             headers = {"Content-Type": "application/json"}
             if api_key:
@@ -1033,6 +1075,8 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
         body = {"contents": [{"parts": [{"text": "你是谁呀，小朋友"}]}]}
         model_names = [gemini_model] if model else ["gemini-2.0-flash", "gemini-1.5-flash"]
         for m in model_names:
+            if _fatal["dead"]:
+                return None
             url = f"{endpoint}/models/{m}:generateContent"
             headers = {"Content-Type": "application/json"}
             if api_key:
@@ -1069,6 +1113,8 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
         order = [api_format] + [fmt for fmt in order if fmt != api_format]
 
     for fmt_key in order:
+        if _fatal["dead"]:
+            break
         result = format_funcs[fmt_key]()
         if result:
             return result
