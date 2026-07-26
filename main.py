@@ -107,6 +107,64 @@ def get_centered_window_position(width, height):
     return (max((screen_width - width) // 2, 0), max((screen_height - height) // 2, 0))
 
 
+def enable_taskbar_minimize(hwnd) -> bool:
+    """让无边框窗口支持任务栏图标再次点击最小化。
+
+    pywebview frameless 会去掉系统标题栏，通常也丢掉 WS_MINIMIZEBOX。
+    没有最小化框时，任务栏按钮只会激活窗口，不会在「显示 ↔ 最小化」间切换。
+    标题栏自定义缩小按钮走的是程序化 minimize()，所以仍可用。
+    """
+    if not hwnd:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        GWL_STYLE = -16
+        WS_MINIMIZEBOX = 0x00020000
+        WS_SYSMENU = 0x00080000
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        SWP_FRAMECHANGED = 0x0020
+
+        # 64 位下优先 Get/SetWindowLongPtrW
+        try:
+            get_long = user32.GetWindowLongPtrW
+            set_long = user32.SetWindowLongPtrW
+            get_long.restype = ctypes.c_ssize_t
+            set_long.restype = ctypes.c_ssize_t
+            get_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            set_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+        except AttributeError:
+            get_long = user32.GetWindowLongW
+            set_long = user32.SetWindowLongW
+            get_long.restype = ctypes.c_long
+            set_long.restype = ctypes.c_long
+            get_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            set_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+
+        style = int(get_long(ctypes.c_void_p(hwnd), GWL_STYLE))
+        new_style = style | WS_MINIMIZEBOX | WS_SYSMENU
+        if new_style == style:
+            return True
+        set_long(ctypes.c_void_p(hwnd), GWL_STYLE, new_style)
+        user32.SetWindowPos.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+        ]
+        user32.SetWindowPos.restype = ctypes.c_bool
+        user32.SetWindowPos(
+            ctypes.c_void_p(hwnd),
+            None,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"enable_taskbar_minimize failed: {e}")
+        return False
+
+
 class API:
     """Backend API exposed to frontend"""
 
@@ -120,6 +178,8 @@ class API:
         self._force_quit = False
         self._closing = False
         self._auto_backup_timer = None
+        self._fade_lock = threading.Lock()
+        self._fade_token = 0  # 取消进行中的淡入淡出
 
         # Initialize database
         db.init_db()
@@ -187,7 +247,7 @@ class API:
             pass
 
     def hide_to_tray(self):
-        """隐藏主窗口到托盘"""
+        """隐藏主窗口到托盘（微信风格缩向托盘）。"""
         if not self._window:
             return {"success": False}
         try:
@@ -201,33 +261,52 @@ class API:
             self.start_tray()
         if self._tray:
             try:
-                self._window.hide()
+                self._animate_hide_to_tray()
                 return {"success": True, "hidden": True}
             except Exception as e:
                 logger.warning(f"hide_to_tray failed: {e}")
+                try:
+                    self._window.hide()
+                    return {"success": True, "hidden": True}
+                except Exception:
+                    pass
         # 托盘不可用则直接退出
         self.quit_app()
         return {"success": True, "hidden": False}
 
     def show_window(self):
-        """从托盘恢复主窗口"""
+        """从托盘恢复主窗口（从托盘角展开）。"""
         if not self._window:
             return {"success": False}
         try:
-            self._window.show()
-            try:
-                self._window.restore()
-            except Exception:
-                pass
+            self._animate_show_from_tray()
             return {"success": True}
         except Exception as e:
             logger.warning(f"show_window failed: {e}")
-            return {"success": False, "error": str(e)}
+            try:
+                self._window.show()
+                try:
+                    self._window.restore()
+                except Exception:
+                    pass
+                return {"success": True}
+            except Exception as e2:
+                return {"success": False, "error": str(e2)}
 
     def minimize_window(self):
-        """最小化窗口"""
+        """最小化窗口（标题栏缩小 / 任务栏切换共用）。"""
+        if not self._window:
+            return
         try:
             self._window.minimize()
+            return
+        except Exception:
+            pass
+        # 回退：直接 Win32 最小化
+        try:
+            hwnd = self._get_hwnd()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(ctypes.c_void_p(hwnd), 6)  # SW_MINIMIZE
         except Exception:
             pass
 
@@ -259,6 +338,231 @@ class API:
                     return int(handle)
                 except Exception:
                     return None
+
+    def _get_window_bounds(self):
+        """当前窗口屏幕坐标 (x, y, w, h)。"""
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return None
+        rect = RECT()
+        user32 = ctypes.windll.user32
+        user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
+        user32.GetWindowRect.restype = ctypes.c_bool
+        if not user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rect)):
+            return None
+        return (
+            int(rect.left),
+            int(rect.top),
+            int(rect.right - rect.left),
+            int(rect.bottom - rect.top),
+        )
+
+    def _get_tray_anchor(self, box: int = 56):
+        """托盘附近锚点矩形（工作区右下角），模拟微信收纳方向。"""
+        work = RECT()
+        user32 = ctypes.windll.user32
+        # SPI_GETWORKAREA
+        if user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0):
+            right, bottom = int(work.right), int(work.bottom)
+            left, top = int(work.left), int(work.top)
+        else:
+            right = int(user32.GetSystemMetrics(0))
+            bottom = int(user32.GetSystemMetrics(1))
+            left, top = 0, 0
+        # 任务栏在底部时托盘多在右下；留边距避免贴边
+        x = max(left, right - box - 12)
+        y = max(top, bottom - box - 12)
+        return x, y, box, box
+
+    def _set_window_bounds(self, x, y, w, h, *, hide_window: bool = False, show_window: bool = False):
+        """SetWindowPos 调整几何；可保持隐藏状态。"""
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return False
+        user32 = ctypes.windll.user32
+        user32.SetWindowPos.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+        ]
+        user32.SetWindowPos.restype = ctypes.c_bool
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        SWP_HIDEWINDOW = 0x0080
+        SWP_SHOWWINDOW = 0x0040
+        flags = SWP_NOZORDER | SWP_NOACTIVATE
+        if hide_window:
+            flags |= SWP_HIDEWINDOW
+        if show_window:
+            flags |= SWP_SHOWWINDOW
+        return bool(
+            user32.SetWindowPos(
+                ctypes.c_void_p(hwnd), None,
+                int(x), int(y), max(int(w), 1), max(int(h), 1), flags,
+            )
+        )
+
+    @staticmethod
+    def _ease_in_cubic(t: float) -> float:
+        return t * t * t
+
+    @staticmethod
+    def _ease_out_cubic(t: float) -> float:
+        return 1.0 - (1.0 - t) ** 3
+
+    def _animate_bounds(self, start, end, duration_ms: int, token: int, ease) -> bool:
+        """插值窗口矩形。start/end: (x,y,w,h)。"""
+        if not start or not end:
+            return False
+        steps = max(int(duration_ms / 14), 10)
+        delay = max(duration_ms / steps / 1000.0, 0.01)
+        sx, sy, sw, sh = start
+        ex, ey, ew, eh = end
+        for i in range(steps + 1):
+            if token != self._fade_token:
+                return False
+            t = ease(i / steps)
+            x = int(sx + (ex - sx) * t)
+            y = int(sy + (ey - sy) * t)
+            w = int(sw + (ew - sw) * t)
+            h = int(sh + (eh - sh) * t)
+            self._set_window_bounds(x, y, w, h)
+            if i < steps:
+                time.sleep(delay)
+        return token == self._fade_token
+
+    def _play_frontend_window_anim(self, kind: str):
+        """通知前端播 CSS 过渡（内容层）；失败忽略。"""
+        if not self._window:
+            return
+        try:
+            # kind: hide | show | reset
+            js = f"if (window.app && window.app.playWindowAnim) window.app.playWindowAnim({json.dumps(kind)});"
+            self._window.evaluate_js(js)
+        except Exception:
+            pass
+
+    def _animate_hide_to_tray(self, duration_ms: int = 260):
+        """微信风格：整窗缩向托盘角，再隐藏。
+
+        WebView2 下 Form.Opacity / AnimateWindow 几乎无感；改几何缩放更明显。
+        """
+        self._fade_token += 1
+        token = self._fade_token
+
+        def _run():
+            with self._fade_lock:
+                try:
+                    if token != self._fade_token:
+                        return
+                    bounds = self._get_window_bounds()
+                    if bounds:
+                        self._saved_bounds = bounds
+                    else:
+                        self._saved_bounds = None
+                    tray = self._get_tray_anchor(48)
+                    self._play_frontend_window_anim("hide")
+                    ok = False
+                    if bounds:
+                        ok = self._animate_bounds(
+                            bounds, tray, duration_ms, token, self._ease_in_cubic
+                        )
+                    if token != self._fade_token:
+                        return
+                    try:
+                        if self._window:
+                            self._window.hide()
+                    except Exception as e:
+                        logger.warning(f"hide after anim failed: {e}")
+                    # 隐藏后恢复原始尺寸/位置，避免下次显示仍是小方块
+                    if self._saved_bounds:
+                        x, y, w, h = self._saved_bounds
+                        self._set_window_bounds(x, y, w, h, hide_window=True)
+                    if not ok and not bounds:
+                        logger.warning("window bounds unavailable; hid without shrink anim")
+                except Exception as e:
+                    logger.warning(f"animate hide failed: {e}")
+                    try:
+                        if self._window:
+                            self._window.hide()
+                    except Exception:
+                        pass
+                finally:
+                    self._play_frontend_window_anim("reset")
+
+        threading.Thread(target=_run, daemon=True, name="TrayHideAnim").start()
+
+    def _animate_show_from_tray(self, duration_ms: int = 260):
+        """微信风格：从托盘角小窗展开到原位置。"""
+        self._fade_token += 1
+        token = self._fade_token
+
+        def _run():
+            with self._fade_lock:
+                try:
+                    if token != self._fade_token:
+                        return
+                    end = getattr(self, "_saved_bounds", None) or self._get_window_bounds()
+                    if not end:
+                        # 兜底：直接显示
+                        if self._window:
+                            self._window.show()
+                            try:
+                                self._window.restore()
+                            except Exception:
+                                pass
+                        self._play_frontend_window_anim("show")
+                        return
+                    tray = self._get_tray_anchor(48)
+                    # 先放到托盘小窗再显示，避免闪全尺寸
+                    self._set_window_bounds(*tray, hide_window=True)
+                    try:
+                        if self._window:
+                            self._window.show()
+                            try:
+                                self._window.restore()
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.warning(f"show before anim failed: {e}")
+                    self._set_window_bounds(*tray)  # 确保可见时仍是小窗
+                    self._play_frontend_window_anim("show")
+                    self._animate_bounds(tray, end, duration_ms, token, self._ease_out_cubic)
+                    if token != self._fade_token:
+                        return
+                    # 最终几何对齐
+                    self._set_window_bounds(*end)
+                    try:
+                        if self._window:
+                            self._window.show()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(f"animate show failed: {e}")
+                    try:
+                        if self._window:
+                            self._window.show()
+                            try:
+                                self._window.restore()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                finally:
+                    # 稍后再 reset，让 CSS 入场播完
+                    time.sleep(0.05)
+                    self._play_frontend_window_anim("reset")
+
+        threading.Thread(target=_run, daemon=True, name="TrayShowAnim").start()
+
+    def _ensure_taskbar_minimize(self):
+        """窗口就绪后补上任务栏最小化样式（可重试）。"""
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return False
+        ok = enable_taskbar_minimize(hwnd)
+        if ok:
+            logger.info("Taskbar minimize style enabled")
+        return ok
 
     def _run_on_ui(self, fn):
         """把 Win32 调用切到 UI 线程执行（WebView2 桥接线程上 ReleaseCapture 会失败）。"""
@@ -422,15 +726,21 @@ class API:
                 return True
         except Exception:
             pass
-        # 返回 False 取消关闭
+        # 返回 False 取消关闭；异步缩向托盘，避免生硬闪没
         try:
             if not self._tray:
                 self.start_tray()
             if self._tray and self._window:
-                self._window.hide()
+                self._animate_hide_to_tray()
                 return False
         except Exception as e:
             logger.warning(f"on_window_closing hide failed: {e}")
+            try:
+                if self._window:
+                    self._window.hide()
+                    return False
+            except Exception:
+                pass
         # 无法托盘化则允许退出
         self._closing = True
         try:
@@ -449,6 +759,10 @@ class API:
     def get_providers(self):
         """Get all providers"""
         return providers.get_provider_list_formatted()
+
+    def get_provider_key(self, provider_id):
+        """按需返回单个供应商的明文 API Key（复制/显示时调用）"""
+        return providers.get_provider_key(provider_id)
 
     def get_stats(self):
         """Get statistics"""
@@ -1285,6 +1599,18 @@ def main():
 
     def _on_started():
         try:
+            # 无边框窗口补 WS_MINIMIZEBOX，使任务栏图标可再次点击最小化
+            if not api._ensure_taskbar_minimize():
+                def _retry_taskbar_style():
+                    for _ in range(10):
+                        time.sleep(0.3)
+                        if api._ensure_taskbar_minimize():
+                            return
+                threading.Thread(
+                    target=_retry_taskbar_style,
+                    daemon=True,
+                    name="TaskbarMinimizeStyle",
+                ).start()
             # 默认启用托盘（可设置关闭）
             minimize_to_tray = db.get_setting("minimize_to_tray")
             if minimize_to_tray not in ("false", "0"):

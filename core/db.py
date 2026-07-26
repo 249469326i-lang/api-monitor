@@ -10,11 +10,19 @@ from typing import List, Dict, Optional, Any
 
 
 def get_db_path() -> str:
-    """获取自有数据库路径"""
-    db_dir = os.path.join(
-        os.environ.get("APPDATA") or os.path.expanduser("~"),
-        ".cc-switch-monitor",
-    )
+    """获取自有数据库路径
+
+    支持 API_MONITOR_DATA_DIR 环境变量覆盖数据目录，
+    供验证脚本/测试隔离使用，避免污染真实数据。
+    """
+    override = os.environ.get("API_MONITOR_DATA_DIR")
+    if override:
+        db_dir = override
+    else:
+        db_dir = os.path.join(
+            os.environ.get("APPDATA") or os.path.expanduser("~"),
+            ".cc-switch-monitor",
+        )
     os.makedirs(db_dir, exist_ok=True)
     return os.path.join(db_dir, "providers.db")
 
@@ -46,8 +54,11 @@ def discover_ccswitch_db() -> Optional[str]:
 @contextmanager
 def get_connection():
     """获取数据库连接的 context manager，自动管理 commit/rollback/close"""
-    conn = sqlite3.connect(get_db_path())
+    conn = sqlite3.connect(get_db_path(), timeout=10)
     conn.row_factory = sqlite3.Row
+    # foreign_keys 是每连接属性，必须在每个连接上启用，
+    # 否则 ON DELETE CASCADE 全部失效
+    conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn
         conn.commit()
@@ -330,18 +341,20 @@ def update_api_format(provider_id: int, api_format: str) -> bool:
 
 
 def get_stats() -> Dict[str, int]:
-    """获取统计数据"""
-    providers = get_providers()
-    total = len(providers)
-    ok = sum(1 for p in providers if p.get("status") == "ok")
-    fail = sum(1 for p in providers if p.get("status") == "fail")
-    pending = sum(1 for p in providers if p.get("status") in ("pending", None))
-
+    """获取统计数据（纯 SQL 聚合，不解密任何 Key）"""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS n FROM providers GROUP BY status"
+        ).fetchall()
+    counts = {r["status"]: r["n"] for r in rows}
+    ok = counts.get("ok", 0)
+    fail = counts.get("fail", 0)
+    total = sum(counts.values())
     return {
         "total": total,
         "ok": ok,
         "fail": fail,
-        "pending": pending,
+        "pending": total - ok - fail,
     }
 
 

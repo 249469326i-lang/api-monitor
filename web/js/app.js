@@ -82,6 +82,22 @@ class App {
         return this.api || this._mock || (this._mock = new MockBackend());
     }
 
+    /* --------------------- Window tray transition -------------------- */
+    /** 由后端 evaluate_js 调用；也可本地预播。kind: hide|show|reset */
+    playWindowAnim(kind) {
+        const root = document.documentElement;
+        const body = document.body;
+        root.classList.remove('window-anim-hide', 'window-anim-show');
+        body.classList.remove('window-anim-hide', 'window-anim-show');
+        if (kind === 'hide') {
+            root.classList.add('window-anim-hide');
+            body.classList.add('window-anim-hide');
+        } else if (kind === 'show') {
+            root.classList.add('window-anim-show');
+            body.classList.add('window-anim-show');
+        }
+    }
+
     /* ----------------------------- Events ----------------------------- */
     bindEvents() {
         // Window controls (frameless mode)
@@ -93,6 +109,8 @@ class App {
         });
         document.getElementById('winCloseBtn')?.addEventListener('click', async () => {
             try {
+                // 先本地预播，再交给后端做整窗缩向托盘（WebView2 下 Opacity 无效）
+                this.playWindowAnim('hide');
                 if (this.api?.hide_to_tray) await this.api.hide_to_tray();
                 else if (this.api?.close_window) this.api.close_window();
             } catch (e) {
@@ -500,6 +518,18 @@ class App {
     }
 
     /* ------------------------------ Copy ------------------------------ */
+    // 按需向后端获取单个供应商的明文 Key（不缓存、不落 DOM）
+    async _fetchProviderKey(id) {
+        try {
+            const r = await this.backend().get_provider_key(id);
+            if (r?.success) return r.api_key || '';
+            this.toast(r?.error || '获取 Key 失败', 'error');
+        } catch (e) {
+            this.toast('获取 Key 失败', 'error');
+        }
+        return '';
+    }
+
     async copyToClipboard(text, label) {
         if (!text || text === '-') return;
         try {
@@ -1128,21 +1158,21 @@ class App {
             // API format label
             const fmtLabel = this._apiFormatLabel(provider.api_format, '-');
 
-            // Pre-compute API key HTML to isolate errors
+            // API Key 区块：DOM 中只放掩码，明文通过 get_provider_key 按需获取
+            // （复制/显示时才向后端请求，不落入 DOM 属性）
             let apiKeyHtml = '';
             try {
-                const rawKey = String(provider.api_key || '');
-                const maskedKey = this._maskKey(rawKey);
-                const escKey = this.escape(rawKey);
+                const maskedKey = provider.key || '-';
+                const hasKey = maskedKey !== '-';
                 const escMasked = this.escape(maskedKey);
                 apiKeyHtml = '<div class="info-item info-full">'
                     + '<div class="info-label">API Key</div>'
                     + '<div class="info-value mono api-key-wrap">'
-                    + '<span class="api-key-text" id="apiKeyText" data-full="' + escKey + '">' + escMasked + '</span>'
-                    + '<button class="dc-copy-btn" data-copy="' + escKey + '" data-label="API Key" title="复制 API Key">'
+                    + '<span class="api-key-text" id="apiKeyText" data-masked="' + escMasked + '">' + escMasked + '</span>'
+                    + (hasKey ? '<button class="dc-copy-btn" id="apiKeyCopy" title="复制 API Key">'
                     + '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
                     + '</button>'
-                    + (rawKey ? '<button class="api-key-toggle" id="apiKeyToggle" title="显示/隐藏">'
+                    + '<button class="api-key-toggle" id="apiKeyToggle" title="显示/隐藏">'
                     + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>'
                     + '</button>' : '')
                     + '</div></div>';
@@ -1286,25 +1316,40 @@ class App {
 
         // Bind copy button click events
         detailInfo.querySelectorAll('.dc-copy-btn').forEach(btn => {
+            if (btn.id === 'apiKeyCopy') return; // API Key 复制走按需取 key 逻辑
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 this.copyToClipboard(btn.dataset.copy, btn.dataset.label);
             });
         });
 
-        // Bind API key show/hide toggle
+        // API Key 复制：点击时才向后端取明文
+        const keyCopyBtn = document.getElementById('apiKeyCopy');
+        if (keyCopyBtn) {
+            keyCopyBtn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const key = await this._fetchProviderKey(provider.id);
+                if (key) this.copyToClipboard(key, 'API Key');
+            });
+        }
+
+        // API Key 显示/隐藏：显示时才向后端取明文，隐藏时恢复掩码
         const toggleBtn = document.getElementById('apiKeyToggle');
         if (toggleBtn) {
-            toggleBtn.addEventListener('click', (e) => {
+            toggleBtn.addEventListener('click', async (e) => {
                 e.stopPropagation();
                 const span = document.getElementById('apiKeyText');
                 if (!span) return;
-                const full = span.dataset.full || '';
                 if (toggleBtn.classList.toggle('revealed')) {
-                    span.textContent = full;
-                    toggleBtn.title = '隐藏';
+                    const key = await this._fetchProviderKey(provider.id);
+                    if (key) {
+                        span.textContent = key;
+                        toggleBtn.title = '隐藏';
+                    } else {
+                        toggleBtn.classList.remove('revealed');
+                    }
                 } else {
-                    span.textContent = this._maskKey(full);
+                    span.textContent = span.dataset.masked || '-';
                     toggleBtn.title = '显示/隐藏';
                 }
             });
@@ -1618,12 +1663,12 @@ class App {
                 // 端点不支持模型列表 — 在 dropdown 内友好提示，不弹错误 toast
                 if (dropdown) {
                     dropdown.style.display = 'block';
-                    dropdown.innerHTML = `<div class="model-dropdown-empty">${r.error || '该端点不支持模型列表，请手动填写'}</div>`;
+                    dropdown.innerHTML = `<div class="model-dropdown-empty">${this.escape(r.error || '该端点不支持模型列表，请手动填写')}</div>`;
                 }
             } else {
                 if (dropdown) {
                     dropdown.style.display = 'block';
-                    dropdown.innerHTML = `<div class="model-dropdown-empty">${r?.error || '未找到模型'}</div>`;
+                    dropdown.innerHTML = `<div class="model-dropdown-empty">${this.escape(r?.error || '未找到模型')}</div>`;
                 }
                 this.toast(r?.error || '获取模型失败', 'error');
             }
@@ -1631,7 +1676,7 @@ class App {
             if (btn) btn.classList.remove('loading');
             if (dropdown) {
                 dropdown.style.display = 'block';
-                dropdown.innerHTML = `<div class="model-dropdown-empty">${e.message}</div>`;
+                dropdown.innerHTML = `<div class="model-dropdown-empty">${this.escape(e.message)}</div>`;
             }
             this.toast('获取模型失败: ' + e.message, 'error');
         }
@@ -2706,7 +2751,6 @@ class MockBackend {
             api_format: p.api_format || '',
             category: p.category || '',
             notes: p.notes || '',
-            api_key: p.api_key || '',
         }));
     }
 
@@ -2719,6 +2763,12 @@ class MockBackend {
 
     async get_providers() {
         return this._format(this._load());
+    }
+
+    async get_provider_key(id) {
+        const p = this._findRaw(id);
+        if (!p) return { success: false, error: '供应商不存在' };
+        return { success: true, api_key: p.api_key || '' };
     }
 
     async get_stats() {

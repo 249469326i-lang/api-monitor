@@ -2,10 +2,18 @@
 后端 API 验证脚本 - 逐个真实调用 main.API 的每个方法
 用法: python verify_backend.py
 退出码 0 = 全部通过,否则打印失败项
+
+所有 DB 操作都在临时目录中进行(API_MONITOR_DATA_DIR),不触碰真实数据。
 """
 import sys
 import os
 import json
+import tempfile
+
+# 必须在 import main 之前设置:把数据目录重定向到临时目录,
+# 避免增删改/导入操作污染 %APPDATA% 下的真实数据库
+_tmp_dir = tempfile.mkdtemp(prefix="api_monitor_verify_")
+os.environ["API_MONITOR_DATA_DIR"] = _tmp_dir
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -165,10 +173,10 @@ def main():
         else:
             failed += 1
 
-    # 13. launch_claude - 系统环境可能没有 claude,允许失败但必须返回 dict
-    lc_r = api.launch_claude()
-    ok = isinstance(lc_r, dict) and ("success" in lc_r)
-    if step("launch_claude", ok, str(lc_r)):
+    # 13. launch_claude - 只验证方法存在且可调用;不真实执行
+    # (真实执行会弹出终端窗口,不适合验证脚本)
+    ok = callable(getattr(api, "launch_claude", None))
+    if step("launch_claude_exists", ok):
         passed += 1
     else:
         failed += 1

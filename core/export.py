@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import shutil
+import sqlite3
 import time
 from typing import Dict, List, Optional
 from . import db
@@ -128,7 +129,17 @@ def create_backup(target_path: str = None) -> Dict:
         target_path = os.path.join(backup_dir, f"providers_backup_{ts}.db")
 
     try:
-        shutil.copy2(src, target_path)
+        # 数据库启用了 WAL，直接 copy 主文件会丢失未 checkpoint 的写入。
+        # 使用 sqlite3 在线备份 API，保证备份是完整一致的快照。
+        src_conn = sqlite3.connect(src)
+        try:
+            dst_conn = sqlite3.connect(target_path)
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+        finally:
+            src_conn.close()
         # 清理旧备份（保留最近 7 份）
         _cleanup_old_backups(keep=7)
         return {"success": True, "path": target_path}
@@ -144,10 +155,27 @@ def restore_backup(backup_path: str) -> Dict:
     current = db.get_db_path()
 
     try:
-        # 先备份当前数据库
+        # 先备份当前数据库（用在线备份保证一致性）
         safety_path = current + ".pre_restore"
         if os.path.exists(current):
-            shutil.copy2(current, safety_path)
+            src_conn = sqlite3.connect(current)
+            try:
+                dst_conn = sqlite3.connect(safety_path)
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+            finally:
+                src_conn.close()
+
+        # 清掉残留的 WAL/SHM，否则下次打开时旧 WAL 会回放到刚恢复的库上
+        for suffix in ("-wal", "-shm"):
+            stale = current + suffix
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
 
         # 恢复
         shutil.copy2(backup_path, current)

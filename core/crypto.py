@@ -7,8 +7,11 @@ API Key 加密模块 - 基于 Windows DPAPI
 """
 
 import base64
+import logging
 import sys
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 _ENCRYPTED_PREFIX = "enc:"
 
@@ -49,6 +52,7 @@ def encrypt_key(plaintext: str) -> str:
         if not ctypes.windll.crypt32.CryptProtectData(
             ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
         ):
+            logger.warning("DPAPI 加密失败，API Key 将以明文存储")
             return plaintext
 
         encrypted = ctypes.string_at(blob_out.pbData, blob_out.cbData)
@@ -56,6 +60,7 @@ def encrypt_key(plaintext: str) -> str:
 
         return _ENCRYPTED_PREFIX + base64.b64encode(encrypted).decode("ascii")
     except Exception:
+        logger.warning("DPAPI 加密异常，API Key 将以明文存储", exc_info=True)
         return plaintext
 
 
@@ -95,6 +100,8 @@ def decrypt_key(stored: str) -> str:
         if not ctypes.windll.crypt32.CryptUnprotectData(
             ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
         ):
+            # 常见于备份跨机器/跨用户恢复:DPAPI 与用户绑定,无法解密
+            logger.warning("DPAPI 解密失败（Key 可能来自其他机器/用户的备份），需重新录入")
             return stored
 
         decrypted = ctypes.string_at(blob_out.pbData, blob_out.cbData)

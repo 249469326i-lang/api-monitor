@@ -351,11 +351,15 @@ def set_current_provider(provider_id: int) -> Dict[str, Any]:
         env["ANTHROPIC_MODEL"] = model
     settings["env"] = env
 
-    # 写入文件
+    # 原子写入：先写临时文件再 os.replace，避免写入中途崩溃/并发留下半个 JSON
     try:
         os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-        with open(settings_path, "w", encoding="utf-8") as f:
+        tmp_path = settings_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, settings_path)
     except Exception as e:
         return {"success": False, "error": f"写入 settings.json 失败: {e}"}
 
@@ -716,47 +720,17 @@ def get_provider_list_formatted() -> List[Dict[str, Any]]:
     Returns:
         格式化后的供应商列表
     """
-    providers_list = db.get_providers()
-    result = []
+    # 复用 _format_provider：不下发明文 api_key，前端需要时
+    # 通过 get_provider_key(id) 按需获取
+    return [_format_provider(p) for p in db.get_providers()]
 
-    for p in providers_list:
-        status = p.get("status", "pending")
-        latency = p.get("latency")
-        latency_str = f"{latency}ms" if latency else "-"
 
-        # 掩码 API Key
-        api_key = p.get("api_key", "")
-        if api_key and len(api_key) > 8:
-            key_masked = api_key[:4] + "..." + api_key[-4:]
-        elif api_key:
-            key_masked = "****"
-        else:
-            key_masked = "-"
-
-        # 状态详情文本
-        detail_map = {
-            "ok": p.get("test_detail") or "正常",
-            "fail": p.get("test_detail") or "连接失败",
-            "testing": "测试中...",
-            "pending": "未测试",
-        }
-        detail = detail_map.get(status, status)
-
-        result.append({
-            "id": str(p["id"]),
-            "name": p.get("name", ""),
-            "app_type": p.get("app_type", "claude"),
-            "role": p.get("role", "备用"),
-            "endpoint": p.get("endpoint", ""),
-            "key": key_masked,
-            "api_key": api_key,
-            "api_format": p.get("api_format", ""),
-            "status": status,
-            "latency": latency_str,
-            "detail": detail,
-            "category": p.get("category", ""),
-            "notes": p.get("notes", ""),
-            "default_model": p.get("default_model", ""),
-        })
-
-    return result
+def get_provider_key(provider_id: int) -> Dict[str, Any]:
+    """按 ID 返回单个供应商的明文 API Key（仅供前端复制/显示时按需调用）"""
+    try:
+        p = db.get_provider(int(provider_id))
+    except (TypeError, ValueError):
+        return {"success": False, "error": "无效的供应商 ID"}
+    if not p:
+        return {"success": False, "error": "供应商不存在"}
+    return {"success": True, "api_key": p.get("api_key", "")}

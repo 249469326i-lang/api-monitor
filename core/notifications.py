@@ -42,37 +42,46 @@ def _send_toast(event_type: str, title: str, message: str):
         return
 
     try:
-        # 使用 PowerShell 发送 Windows Toast 通知（无额外依赖）
+        # 使用 PowerShell 发送 Windows Toast 通知（无额外依赖）。
+        # 通知内容可能包含上游 API 返回的任意文本，绝不能拼进脚本文本
+        # （here-string 中 $() 会被展开执行）。这里在 Python 侧完成 XML 转义，
+        # 整段 XML 经环境变量传入；脚本本身是固定的，用 -EncodedCommand 传递。
+        import base64
+        import os
         import subprocess
-        escaped_title = title.replace("'", "''")
-        escaped_msg = message.replace("'", "''")
+        from xml.sax.saxutils import escape as _xml_escape
 
-        ps_script = f"""
-        [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
-        [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
-        $template = @"
-        <toast duration="short">
-            <visual>
-                <binding template="ToastGeneric">
-                    <text>API Monitor</text>
-                    <text>{escaped_title}: {escaped_msg}</text>
-                </binding>
-            </visual>
-            <audio src="ms-winsoundevent:Notification.Default"/>
-        </toast>
-"@
-        $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-        $xml.LoadXml($template)
-        $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("API Monitor").Show($toast)
-        """
+        toast_xml = (
+            '<toast duration="short">'
+            "<visual>"
+            '<binding template="ToastGeneric">'
+            "<text>API Monitor</text>"
+            f"<text>{_xml_escape(f'{title}: {message}')}</text>"
+            "</binding>"
+            "</visual>"
+            '<audio src="ms-winsoundevent:Notification.Default"/>'
+            "</toast>"
+        )
+
+        ps_script = (
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null\n"
+            "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null\n"
+            "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument\n"
+            "$xml.LoadXml($env:API_MONITOR_TOAST_XML)\n"
+            "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)\n"
+            '[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("API Monitor").Show($toast)\n'
+        )
+        encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+        env = os.environ.copy()
+        env["API_MONITOR_TOAST_XML"] = toast_xml
 
         # 在后台线程中执行，避免阻塞主线程
         threading.Thread(
             target=lambda: subprocess.run(
-                ["powershell", "-Command", ps_script],
+                ["powershell", "-NoProfile", "-EncodedCommand", encoded],
                 capture_output=True,
                 timeout=5,
+                env=env,
                 creationflags=0x08000000,  # CREATE_NO_WINDOW
             ),
             daemon=True,

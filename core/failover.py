@@ -21,15 +21,25 @@ def _flag(key: str, default: str = "false") -> bool:
 _last_switch_time = 0
 _consecutive_switches = 0
 _pending_confirm: Optional[dict] = None
-_lock = threading.Lock()
+# RLock：check_and_failover 全程持锁（含 _do_switch），防止并发批测下
+# 多个失败回调同时通过冷却/次数检查导致重复切换
+_lock = threading.RLock()
+
+
+def _int_setting(key: str, default: int) -> int:
+    """安全读取整数设置，坏值回退默认（避免回调线程被 ValueError 炸掉）"""
+    try:
+        return int(db.get_setting(key) or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def get_status() -> dict:
     """Failover 状态摘要（供 UI 展示）"""
     enabled = _flag("failover_enabled", "false")
     need_confirm = _flag("failover_need_confirm", "false")
-    cooldown = int(db.get_setting("failover_cooldown") or "300")
-    max_switches = int(db.get_setting("failover_max_switches") or "3")
+    cooldown = _int_setting("failover_cooldown", 300)
+    max_switches = _int_setting("failover_max_switches", 3)
     now = int(time.time())
     cooldown_remaining = 0
     if _last_switch_time > 0:
@@ -113,30 +123,32 @@ def check_and_failover(failed_provider_id: int, log_callback=None) -> dict:
     if failed.get("role") != "当前":
         return {"switched": False, "reason": "非当前供应商，无需切换"}
 
-    cooldown = int(db.get_setting("failover_cooldown") or "300")
-    now = int(time.time())
-    if _last_switch_time > 0 and now - _last_switch_time < cooldown:
-        remaining = cooldown - (now - _last_switch_time)
-        return {
-            "switched": False,
-            "reason": f"冷却中，还需等待 {remaining}s",
-            "cooldown_remaining": remaining,
-        }
+    # 冷却检查、计数检查到实际切换必须整段持锁：
+    # 并发批测下多个失败回调会同时到达这里
+    with _lock:
+        cooldown = _int_setting("failover_cooldown", 300)
+        now = int(time.time())
+        if _last_switch_time > 0 and now - _last_switch_time < cooldown:
+            remaining = cooldown - (now - _last_switch_time)
+            return {
+                "switched": False,
+                "reason": f"冷却中，还需等待 {remaining}s",
+                "cooldown_remaining": remaining,
+            }
 
-    max_switches = int(db.get_setting("failover_max_switches") or "3")
-    if _consecutive_switches >= max_switches:
-        return {
-            "switched": False,
-            "reason": f"已达最大连续切换次数({max_switches})",
-        }
+        max_switches = _int_setting("failover_max_switches", 3)
+        if _consecutive_switches >= max_switches:
+            return {
+                "switched": False,
+                "reason": f"已达最大连续切换次数({max_switches})",
+            }
 
-    candidate = _find_best_candidate(exclude_id=failed_provider_id)
-    if not candidate:
-        return {"switched": False, "reason": "没有可用的备用供应商"}
+        candidate = _find_best_candidate(exclude_id=failed_provider_id)
+        if not candidate:
+            return {"switched": False, "reason": "没有可用的备用供应商"}
 
-    need_confirm = _flag("failover_need_confirm", "false")
-    if need_confirm:
-        with _lock:
+        need_confirm = _flag("failover_need_confirm", "false")
+        if need_confirm:
             _pending_confirm = {
                 "from": failed.get("name", ""),
                 "from_id": failed_provider_id,
@@ -145,35 +157,35 @@ def check_and_failover(failed_provider_id: int, log_callback=None) -> dict:
                 "candidate": candidate,
                 "ts": now,
             }
-        log("warn", f"⚡ 建议切换到 [{candidate.get('name')}]，等待确认…")
-        try:
-            notifications.notify(
-                "failover",
-                "等待确认故障切换",
-                f"当前 [{failed.get('name')}] 不可用，建议切换到 [{candidate.get('name')}]",
-                failed_provider_id,
-            )
-        except Exception:
-            pass
-        return {
-            "switched": False,
-            "need_confirm": True,
-            "reason": "需要确认后切换",
-            "from": failed.get("name", ""),
-            "to": candidate.get("name", ""),
-            "to_id": candidate.get("id"),
-        }
+            log("warn", f"⚡ 建议切换到 [{candidate.get('name')}]，等待确认…")
+            try:
+                notifications.notify(
+                    "failover",
+                    "等待确认故障切换",
+                    f"当前 [{failed.get('name')}] 不可用，建议切换到 [{candidate.get('name')}]",
+                    failed_provider_id,
+                )
+            except Exception:
+                pass
+            return {
+                "switched": False,
+                "need_confirm": True,
+                "reason": "需要确认后切换",
+                "from": failed.get("name", ""),
+                "to": candidate.get("name", ""),
+                "to_id": candidate.get("id"),
+            }
 
-    log(
-        "warn",
-        f"⚡ 当前供应商 [{failed.get('name', '')}] 不可用，正在切换到 [{candidate.get('name', '')}]...",
-    )
-    return _do_switch(
-        failed_name=failed.get("name", ""),
-        candidate=candidate,
-        log_callback=log_callback,
-        reason="自动故障切换",
-    )
+        log(
+            "warn",
+            f"⚡ 当前供应商 [{failed.get('name', '')}] 不可用，正在切换到 [{candidate.get('name', '')}]...",
+        )
+        return _do_switch(
+            failed_name=failed.get("name", ""),
+            candidate=candidate,
+            log_callback=log_callback,
+            reason="自动故障切换",
+        )
 
 
 def _do_switch(failed_name: str, candidate: dict, log_callback=None, reason: str = "") -> dict:
@@ -190,9 +202,9 @@ def _do_switch(failed_name: str, candidate: dict, log_callback=None, reason: str
     if result.get("success"):
         latency = candidate.get("latency")
         latency_str = f"{latency}ms" if latency is not None else "?"
-        _last_switch_time = int(time.time())
-        _consecutive_switches += 1
         with _lock:
+            _last_switch_time = int(time.time())
+            _consecutive_switches += 1
             _pending_confirm = None
 
         try:
