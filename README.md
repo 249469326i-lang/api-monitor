@@ -5,10 +5,13 @@
 
   **Windows 桌面端 API 供应商监控工具 —— 定时测速 · 故障切换 · 托盘常驻 · 密钥加密**
 
+  [![CI](https://img.shields.io/github/actions/workflow/status/249469326i-lang/api-monitor/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/249469326i-lang/api-monitor/actions/workflows/ci.yml)
   [![Release](https://img.shields.io/github/v/release/249469326i-lang/api-monitor?style=flat-square)](https://github.com/249469326i-lang/api-monitor/releases)
+  [![Downloads](https://img.shields.io/github/downloads/249469326i-lang/api-monitor/total?style=flat-square&color=brightgreen)](https://github.com/249469326i-lang/api-monitor/releases)
   [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
   [![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-blue?style=flat-square)](#-系统要求)
   [![Python](https://img.shields.io/badge/python-3.10%2B-green?style=flat-square)](#-源码运行)
+  [![Last Commit](https://img.shields.io/github/last-commit/249469326i-lang/api-monitor?style=flat-square&color=blue)](https://github.com/249469326i-lang/api-monitor/commits/main)
 
   [下载使用](#-下载与安装) · [功能特性](#-功能特性) · [源码构建](#-源码运行) · [贡献指南](CONTRIBUTING.md) · [问题反馈](https://github.com/249469326i-lang/api-monitor/issues)
 
@@ -35,13 +38,17 @@
 
 ## ✨ 功能特性
 
-- 📡 **多供应商监控** — 同时监控多个 API 供应商 / 模型的延迟与可用性
-- ⏱️ **定时探测** — 自定义探测间隔，失败自动重试
-- 🔀 **故障转移** — 主线路异常时自动切换到备用供应商
-- 🖥️ **托盘常驻** — 最小化到系统托盘，支持开机自启
-- 🔐 **密钥加密** — API Key 使用 Windows DPAPI 本地加密存储，绝不明文落盘
-- 📦 **单文件分发** — 打包为独立 `API-Monitor.exe`，下载即用，无需安装 Python
-- 🎨 **像素风 UI** — 内置现代像素风格 Web 前端（PyWebView 渲染）
+| | 功能 | 说明 |
+| --- | --- | --- |
+| 📡 | **多供应商监控** | 同时监控多个 API 供应商 / 模型的延迟与可用性，支持 Anthropic / OpenAI / Gemini 等多种 API 格式自动探测 |
+| ⏱️ | **定时探测** | 自定义探测间隔，失败自动重试；死端点智能短路，不拖慢整轮测试 |
+| 🔀 | **故障转移** | 主线路异常时自动切换到备用供应商（可配置冷却时间、最大切换次数、切换前确认） |
+| 📈 | **历史趋势** | 延迟历史、P95、可用率统计与趋势图表 |
+| 🖥️ | **托盘常驻** | 最小化到系统托盘，支持开机自启 |
+| 🔐 | **密钥加密** | API Key 使用 Windows DPAPI 本地加密存储，绝不明文落盘，前端仅展示掩码 |
+| 💾 | **备份恢复** | SQLite 在线备份 API 保证一致性，支持自动定期备份 |
+| 📦 | **单文件分发** | 打包为独立 `API-Monitor.exe`，下载即用，无需安装 Python |
+| 🎨 | **像素风 UI** | 内置像素风格 Web 前端（PyWebView 渲染），字体本地化、离线可用 |
 
 ## 📥 下载与安装
 
@@ -108,16 +115,24 @@ pyinstaller --noconfirm --clean API-Monitor.spec
 
 ```text
 api-monitor/
-├── main.py                 # 程序入口（PyWebView + 后端 API 桥接）
-├── core/                   # 后端核心模块（探测、故障转移、托盘、更新等）
+├── main.py                 # 程序入口（窗口创建与 webview 引导）
+├── core/                   # 后端核心模块
+│   ├── app_api.py          #   前端 js_api 桥接层（全部后端接口）
+│   ├── testing.py          #   端点探测（多 API 格式自动识别）
+│   ├── failover.py         #   自动故障切换
+│   ├── scheduler.py        #   定时测试调度器
+│   ├── crypto.py           #   DPAPI 密钥加密
+│   ├── db.py / paths.py    #   SQLite 存储与数据目录管理
+│   ├── win32_window.py     #   Win32 窗口辅助（单实例/居中/任务栏）
+│   └── ...                 #   托盘、通知、导出、更新检查等
 ├── web/                    # 前端 UI（index.html / css / js / assets）
-├── docs/                   # 设计文档、CODE_WIKI 与截图
-├── .github/                # Issue / PR 模板
-├── API-Monitor.spec  # PyInstaller 打包规格
+├── docs/                   # CODE_WIKI、截图与开发文档
+├── .github/                # CI workflow 与 Issue / PR 模板
+├── API-Monitor.spec        # PyInstaller 打包规格（白名单资源）
 ├── rebuild.bat             # 一键重打包脚本
 ├── bump_version.py         # 发版时统一更新各处版本号
-├── verify_backend.py       # 后端 API 冒烟验证脚本
-├── test_fetch_models_isolation.py
+├── verify_backend.py       # 后端 API 冒烟验证（临时目录隔离）
+├── test_fetch_models_isolation.py  # 单元测试
 └── requirements.txt        # 运行时依赖
 ```
 
@@ -134,7 +149,15 @@ api-monitor/
 
 ## ✅ 运行测试
 
-提交前请按 [贡献指南 · 提交改动前](CONTRIBUTING.md#提交改动前) 跑通验证命令（`verify_backend.py` 与单元测试）。完整步骤与打包检查也写在该文档，避免多处拷贝命令过期。
+```bash
+# 单元测试（DB 隔离，不触碰真实数据）
+python -m unittest test_fetch_models_isolation -v
+
+# 后端 API 冒烟验证（自动重定向到临时目录）
+python verify_backend.py
+```
+
+每次 push / PR 都会在 GitHub Actions（windows-latest）上自动执行上述验证。提交前请按 [贡献指南](CONTRIBUTING.md#提交改动前) 本地跑通。
 
 ## 🔐 安全说明
 
@@ -146,7 +169,10 @@ api-monitor/
 
 ## 🗺️ 路线图
 
-- [x] 像素风 UI、独立 Provider 存储、自动更新（当前已发布版本）
+- [x] 像素风 UI、独立 Provider 存储、自动更新
+- [x] 全面安全加固（密钥零明文下发、XSS/注入防护、WAL 一致性备份）
+- [x] CI 自动化测试（GitHub Actions）
+- [x] 模块化架构重构（分层 core/）
 - [ ] 探测历史图表与数据导出增强
 - [ ] 更多供应商预设模板
 - [ ] 多语言界面（欢迎 PR）

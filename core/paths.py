@@ -1,4 +1,4 @@
-"""数据目录统一管理与历史目录迁移。
+r"""数据目录统一管理与历史目录迁移。
 
 对外品牌已统一为 API Monitor，数据目录同步从历史的
 %APPDATA%\.cc-switch-monitor 迁移到 %APPDATA%\.api-monitor。

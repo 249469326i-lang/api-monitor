@@ -12,9 +12,16 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# 模块级隔离:部分测试类(ChatEndpointTest 等)不换 APPDATA,直接读设置表。
+# 在干净机器(CI)上没有已初始化的数据库会炸,统一重定向到临时目录并建表。
+_MODULE_TMP = tempfile.mkdtemp(prefix="api_monitor_tests_")
+os.environ["API_MONITOR_DATA_DIR"] = _MODULE_TMP
+
 from main import API
 from core import db, providers, testing
 from core.validators import validate_api_format, validate_model
+
+db.init_db()
 
 
 class _FakeResponse:
@@ -42,9 +49,13 @@ class FetchModelsIsolationTest(unittest.TestCase):
         self._old_appdata = os.environ.get("APPDATA")
         self._old_userprofile = os.environ.get("USERPROFILE")
         self._old_home = os.environ.get("HOME")
+        self._old_data_dir = os.environ.get("API_MONITOR_DATA_DIR")
         os.environ["APPDATA"] = os.path.join(self._tmp, "appdata")
         os.environ["USERPROFILE"] = self._tmp
         os.environ["HOME"] = self._tmp
+        # 数据目录走 API_MONITOR_DATA_DIR（core.paths 的隔离入口），
+        # 每个测试一个全新目录，保证库是干净的
+        os.environ["API_MONITOR_DATA_DIR"] = os.path.join(self._tmp, "data")
         db.init_db()
 
     def tearDown(self):
@@ -60,6 +71,10 @@ class FetchModelsIsolationTest(unittest.TestCase):
             os.environ.pop("HOME", None)
         else:
             os.environ["HOME"] = self._old_home
+        if self._old_data_dir is None:
+            os.environ.pop("API_MONITOR_DATA_DIR", None)
+        else:
+            os.environ["API_MONITOR_DATA_DIR"] = self._old_data_dir
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _create_ccswitch_db(self):
