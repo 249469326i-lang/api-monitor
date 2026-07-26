@@ -109,10 +109,8 @@ def export_test_history_csv(output_path: str, provider_id: int = None, since: in
 
 def get_backup_dir() -> str:
     """获取备份目录"""
-    backup_dir = os.path.join(
-        os.environ.get("APPDATA") or os.path.expanduser("~"),
-        ".cc-switch-monitor", "backups",
-    )
+    from . import paths
+    backup_dir = os.path.join(paths.get_data_dir(), "backups")
     os.makedirs(backup_dir, exist_ok=True)
     return backup_dir
 

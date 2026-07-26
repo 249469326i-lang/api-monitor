@@ -27,7 +27,7 @@ We will acknowledge reports as soon as practical and coordinate a fix before pub
 
 ## Security Notes for Users
 
-- API keys are encrypted with **Windows DPAPI** and stored under `%APPDATA%\.cc-switch-monitor\`.
+- API keys are encrypted with **Windows DPAPI** and stored under `%APPDATA%\.api-monitor\`.
 - Do not commit real API keys, `providers.db`, or local config into git.
 - Prefer downloading release binaries only from this repository’s **GitHub Releases**.
 - Automatic update checks only query GitHub Releases for this project’s repository.

@@ -11,14 +11,11 @@ def setup_logging(level: int = logging.INFO) -> None:
     """
     配置应用日志
 
-    日志文件: %APPDATA%\\.cc-switch-monitor\\app.log
+    日志文件: <数据目录>\\app.log（core.paths 管理，默认 %APPDATA%\\.api-monitor）
     轮转策略: 5MB x 3 份
     """
-    log_dir = os.path.join(
-        os.environ.get("APPDATA") or os.path.expanduser("~"),
-        ".cc-switch-monitor",
-    )
-    os.makedirs(log_dir, exist_ok=True)
+    from . import paths
+    log_dir = paths.get_data_dir()
     log_path = os.path.join(log_dir, "app.log")
 
     handler = RotatingFileHandler(

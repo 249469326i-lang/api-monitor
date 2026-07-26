@@ -5,11 +5,11 @@
     python bump_version.py 3.1.0
 
 会更新:
-    main.py               __version__
+    core/version.py       __version__（单一来源，main.py 从这里导入）
     file_version_info.txt filevers / prodvers / FileVersion / ProductVersion
-    (rebuild.bat 的版本提示已改为运行时从 main.py 读取，无需更新)
+    (rebuild.bat 的版本提示已改为运行时读取，无需更新)
 
-漏改 main.py 的 __version__ 会导致自动更新用旧版本比较，用户永远收不到
+漏改 __version__ 会导致自动更新用旧版本比较，用户永远收不到
 更新提示，因此发版时必须使用本脚本而不是手动逐处修改。
 """
 import re
@@ -33,7 +33,7 @@ def main() -> None:
     root = Path(__file__).resolve().parent
     ver_tuple = f"({', '.join(new.split('.'))}, 0)"
 
-    _replace(root / "main.py", r'__version__ = "[^"]+"', f'__version__ = "{new}"')
+    _replace(root / "core" / "version.py", r'__version__ = "[^"]+"', f'__version__ = "{new}"')
     _replace(root / "file_version_info.txt", r"filevers=\(\d+, \d+, \d+, \d+\)", f"filevers={ver_tuple}")
     _replace(root / "file_version_info.txt", r"prodvers=\(\d+, \d+, \d+, \d+\)", f"prodvers={ver_tuple}")
     _replace(root / "file_version_info.txt", r"(StringStruct\(u'FileVersion', u')[^']+(')", rf"\g<1>{new}\g<2>")

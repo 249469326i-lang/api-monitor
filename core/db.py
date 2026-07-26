@@ -10,21 +10,9 @@ from typing import List, Dict, Optional, Any
 
 
 def get_db_path() -> str:
-    """获取自有数据库路径
-
-    支持 API_MONITOR_DATA_DIR 环境变量覆盖数据目录，
-    供验证脚本/测试隔离使用，避免污染真实数据。
-    """
-    override = os.environ.get("API_MONITOR_DATA_DIR")
-    if override:
-        db_dir = override
-    else:
-        db_dir = os.path.join(
-            os.environ.get("APPDATA") or os.path.expanduser("~"),
-            ".cc-switch-monitor",
-        )
-    os.makedirs(db_dir, exist_ok=True)
-    return os.path.join(db_dir, "providers.db")
+    """获取自有数据库路径（数据目录统一由 core.paths 管理，含历史迁移）"""
+    from . import paths
+    return os.path.join(paths.get_data_dir(), "providers.db")
 
 
 def get_ccswitch_db_path() -> str:
