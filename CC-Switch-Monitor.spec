@@ -5,13 +5,21 @@ block_cipher = None
 datas = []
 
 # ---------------------------------------------------------------------------
-# Bundle the web frontend (index.html, css/, js/)
+# Bundle the web frontend — whitelist only (web/ also contains design
+# prototypes, screenshots and helper scripts that must NOT ship in the exe)
 # ---------------------------------------------------------------------------
 _spec_dir = os.path.dirname(os.path.abspath(SPEC))
 _web_dir = os.path.join(_spec_dir, 'web')
 if os.path.isdir(_web_dir):
-    datas.append((_web_dir, 'web'))
-    print(f"[INFO] Adding web assets: {_web_dir} -> web")
+    datas.append((os.path.join(_web_dir, 'index.html'), 'web'))
+    datas.append((os.path.join(_web_dir, 'css', 'style.css'), 'web/css'))
+    datas.append((os.path.join(_web_dir, 'js', 'app.js'), 'web/js'))
+    _bg_dir = os.path.join(_web_dir, 'assets', 'metric-bg')
+    if os.path.isdir(_bg_dir):
+        for _f in os.listdir(_bg_dir):
+            if _f.lower().endswith(('.gif', '.png', '.webp')) and not _f.startswith('_'):
+                datas.append((os.path.join(_bg_dir, _f), 'web/assets/metric-bg'))
+    print(f"[INFO] Adding whitelisted web assets from: {_web_dir}")
 else:
     print("[WARNING] web/ directory not found next to spec file!")
 
@@ -38,7 +46,19 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'tkinter',
+        'unittest',
+        'pydoc',
+        'doctest',
+        'test',
+        'xmlrpc',
+        'requests',
+        'urllib3',
+        'certifi',
+        'charset_normalizer',
+        'idna',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

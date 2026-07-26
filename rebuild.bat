@@ -48,7 +48,8 @@ if exist "dist\API-Monitor.exe" (
 ) else (
     echo Build FAILED, please check error messages
     echo.
-    pause
+    if "%CI%"=="" pause
+    exit /b 1
 )
 
 REM Cleanup temp files
