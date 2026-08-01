@@ -1278,9 +1278,9 @@ if errorlevel 1 (
 )
 
 echo 更新完成，正在重启...
-set _MEIPASS=
-set _MEIPASS2=
-start "" "{current_exe}"
+
+REM 用 PowerShell Start-Process 启动新进程（完全脱离 _MEIPASS 环境变量）
+powershell -NoProfile -Command "Start-Process -FilePath '{current_exe}'"
 
 del "{temp_exe_path}" >nul 2>&1
 del "%~f0" >nul 2>&1
