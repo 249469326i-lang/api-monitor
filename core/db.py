@@ -89,6 +89,22 @@ def init_db() -> None:
             )
         """)
 
+        # provider_apps 表（每应用绑定：端点/模型/格式/角色 各自独立。
+        # 一个供应商可同时绑定 claude 与 codex，每端一套配置。）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS provider_apps (
+                provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+                app_type TEXT NOT NULL,
+                endpoint TEXT,
+                default_model TEXT,
+                api_format TEXT DEFAULT '',
+                reasoning_effort TEXT DEFAULT '',
+                context_length INTEGER DEFAULT 0,
+                role TEXT DEFAULT '备用',
+                PRIMARY KEY (provider_id, app_type)
+            )
+        """)
+
         # provider_endpoints 表（备用端点）
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS provider_endpoints (
@@ -158,14 +174,36 @@ def init_db() -> None:
         columns = {row[1] for row in cursor.fetchall()}
         if "api_format" not in columns:
             cursor.execute("ALTER TABLE providers ADD COLUMN api_format TEXT DEFAULT ''")
+        if "reasoning_effort" not in columns:
+            cursor.execute("ALTER TABLE providers ADD COLUMN reasoning_effort TEXT DEFAULT ''")
+        if "context_length" not in columns:
+            cursor.execute("ALTER TABLE providers ADD COLUMN context_length INTEGER DEFAULT 0")
+
+        # 迁移：为已有供应商回填 provider_apps（幂等；仅回填单应用行，
+        # 双端 'both' 供应商一定已有绑定行，避免插出 app_type='both' 的脏行）
+        cursor.execute("""
+            INSERT OR IGNORE INTO provider_apps
+                (provider_id, app_type, endpoint, default_model, api_format, role)
+            SELECT id, app_type, endpoint, default_model, api_format, role
+            FROM providers WHERE app_type IN ('claude', 'codex')
+        """)
+
+        # 迁移：为已有 provider_apps 表添加 reasoning_effort / context_length 列
+        cursor.execute("PRAGMA table_info(provider_apps)")
+        pa_columns = {row[1] for row in cursor.fetchall()}
+        if "reasoning_effort" not in pa_columns:
+            cursor.execute("ALTER TABLE provider_apps ADD COLUMN reasoning_effort TEXT DEFAULT ''")
+        if "context_length" not in pa_columns:
+            cursor.execute("ALTER TABLE provider_apps ADD COLUMN context_length INTEGER DEFAULT 0")
 
 
 # ────────────────── SQL 字段白名单 ──────────────────
 
 UPDATABLE_FIELDS = frozenset({
     "name", "app_type", "role", "endpoint", "api_key", "website",
-    "category", "notes", "default_model", "api_format", "status", "latency",
-    "last_test_time", "test_detail",
+    "category", "notes", "default_model", "api_format",
+    "reasoning_effort", "context_length",
+    "status", "latency", "last_test_time", "test_detail",
 })
 
 
@@ -199,16 +237,142 @@ def _maybe_migrate_key(provider_id: int, api_key: str) -> str:
     return crypto.decrypt_key(api_key)
 
 
+# ────────────────── 每应用绑定 (provider_apps) ──────────────────
+
+def _get_provider_apps_map(provider_ids) -> Dict[int, List[Dict[str, Any]]]:
+    """按 provider_id 批量取 provider_apps 绑定，返回 {id: [binding,...]}。"""
+    ids = [pid for pid in (provider_ids or []) if pid is not None]
+    if not ids:
+        return {}
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(
+            f"SELECT provider_id, app_type, endpoint, default_model, api_format, reasoning_effort, context_length, role "
+            f"FROM provider_apps WHERE provider_id IN ({placeholders}) ORDER BY app_type",
+            ids,
+        )
+        rows = cursor.fetchall()
+    result: Dict[int, List[Dict[str, Any]]] = {}
+    for r in rows:
+        result.setdefault(r["provider_id"], []).append({
+            "app_type": r["app_type"],
+            "endpoint": r["endpoint"] or "",
+            "default_model": r["default_model"] or "",
+            "api_format": r["api_format"] or "",
+            "reasoning_effort": r["reasoning_effort"] or "",
+            "context_length": r["context_length"] or 0,
+            "role": r["role"] or "备用",
+        })
+    return result
+
+
+def _app_type_from_bindings(bindings: List[Dict[str, Any]]) -> str:
+    """由绑定列表得出 providers.app_type: 只 claude→'claude', 只 codex→'codex', 都有→'both'。"""
+    types = sorted({b.get("app_type") for b in bindings if b.get("app_type") in ("claude", "codex")})
+    if len(types) == 2:
+        return "both"
+    return types[0] if types else "claude"
+
+
+def _primary_binding(bindings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """主绑定 = 绑了 claude 取 claude，否则取 codex；空则返回空 dict。"""
+    for want in ("claude", "codex"):
+        for b in bindings:
+            if b.get("app_type") == want:
+                return b
+    return {}
+
+
+def _sync_provider_mirrors(cursor, provider_id: int) -> None:
+    """把 provider_apps 的主绑定同步回 providers 的镜像列
+    (app_type/role/endpoint/default_model/api_format/reasoning_effort/context_length)，保持旧代码读取兼容。"""
+    cursor.execute(
+        "SELECT app_type, endpoint, default_model, api_format, reasoning_effort, context_length, role FROM provider_apps "
+        "WHERE provider_id=? ORDER BY (app_type='claude') DESC, app_type",
+        (provider_id,),
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        return
+    primary = rows[0]
+    cursor.execute(
+        "UPDATE providers SET app_type=?, role=?, endpoint=?, default_model=?, api_format=?, reasoning_effort=?, context_length=? WHERE id=?",
+        (
+            _app_type_from_bindings([dict(r) for r in rows]),
+            primary["role"] or "备用",
+            primary["endpoint"] or "",
+            primary["default_model"] or "",
+            primary["api_format"] or "",
+            primary["reasoning_effort"] or "",
+            primary["context_length"] or 0,
+            provider_id,
+        ),
+    )
+
+
+def set_binding_role(provider_id: int, app_type: str, role: str = "当前") -> None:
+    """把指定供应商在指定应用的绑定设为角色，并同步该供应商的镜像列。"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE provider_apps SET role=? WHERE provider_id=? AND app_type=?",
+            (role, provider_id, app_type),
+        )
+        _sync_provider_mirrors(cursor, provider_id)
+
+
+def mark_app_current(provider_id: int, app_type: str) -> None:
+    """指定应用下：其余绑定置备用，目标绑定置当前；同步所有受影响供应商镜像。"""
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT DISTINCT provider_id FROM provider_apps WHERE app_type=? AND provider_id<>?",
+                (app_type, provider_id),
+            )
+            affected = [r[0] for r in cursor.fetchall()]
+            cursor.execute("UPDATE provider_apps SET role='备用' WHERE app_type=?", (app_type,))
+            cursor.execute(
+                "UPDATE provider_apps SET role='当前' WHERE provider_id=? AND app_type=?",
+                (provider_id, app_type),
+            )
+            _sync_provider_mirrors(cursor, provider_id)
+            for pid in affected:
+                _sync_provider_mirrors(cursor, pid)
+    except Exception:
+        pass
+
+
+def clear_app_roles(app_type: str) -> None:
+    """把某应用下所有绑定置备用（官方模式），并同步受影响供应商镜像。"""
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT DISTINCT provider_id FROM provider_apps WHERE app_type=?", (app_type,)
+            )
+            affected = [r[0] for r in cursor.fetchall()]
+            cursor.execute("UPDATE provider_apps SET role='备用' WHERE app_type=?", (app_type,))
+            for pid in affected:
+                _sync_provider_mirrors(cursor, pid)
+    except Exception:
+        pass
+
+
 # ────────────────── 供应商 CRUD ──────────────────
 
 def get_providers() -> List[Dict[str, Any]]:
-    """获取供应商列表（自动解密 API Key，明文 Key 自动迁移为加密格式）"""
+    """获取供应商列表（自动解密 API Key，明文 Key 自动迁移为加密格式）
+    每行额外带 `apps`：按应用绑定的 [{app_type,endpoint,default_model,api_format,role}]。"""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM providers ORDER BY id")
         rows = [dict(row) for row in cursor.fetchall()]
 
+    apps_map = _get_provider_apps_map([r.get("id") for r in rows])
     for row in rows:
+        row["apps"] = apps_map.get(row.get("id"), [])
         if row.get("api_key"):
             row["api_key"] = _maybe_migrate_key(row["id"], row["api_key"])
 
@@ -216,7 +380,7 @@ def get_providers() -> List[Dict[str, Any]]:
 
 
 def get_provider_by_id(provider_id: int) -> Optional[Dict[str, Any]]:
-    """根据 ID 获取供应商（自动解密 API Key）"""
+    """根据 ID 获取供应商（自动解密 API Key，附带 apps 绑定）"""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM providers WHERE id = ?", (provider_id,))
@@ -225,6 +389,7 @@ def get_provider_by_id(provider_id: int) -> Optional[Dict[str, Any]]:
             return None
         result = dict(row)
 
+    result["apps"] = _get_provider_apps_map([result.get("id")]).get(result.get("id"), [])
     if result.get("api_key"):
         result["api_key"] = _maybe_migrate_key(result["id"], result["api_key"])
 
@@ -232,12 +397,40 @@ def get_provider_by_id(provider_id: int) -> Optional[Dict[str, Any]]:
 
 
 def add_provider(provider_data: Dict[str, Any]) -> int:
-    """添加供应商，返回新 ID（API Key 自动加密存储）"""
+    """添加供应商，返回新 ID（API Key 自动加密存储）
+    支持 `apps`：每应用绑定 [{app_type,endpoint,default_model,api_format}]；缺省按单应用旧字段。"""
     now = int(time.time())
     # 加密 API Key
     api_key = provider_data.get("api_key", "")
     if api_key:
         api_key = _encrypt_api_key(api_key)
+
+    apps = provider_data.get("apps")
+    if apps:
+        bindings = [b for b in apps if isinstance(b, dict) and b.get("app_type") in ("claude", "codex")]
+        if not bindings:
+            bindings = [{
+                "app_type": "claude",
+                "endpoint": provider_data.get("endpoint", ""),
+                "default_model": provider_data.get("default_model", ""),
+                "api_format": provider_data.get("api_format", ""),
+                "role": provider_data.get("role", "备用"),
+            }]
+        for b in bindings:
+            b.setdefault("role", "备用")
+        row_app_type = _app_type_from_bindings(bindings)
+        primary = _primary_binding(bindings)
+        row_role = primary.get("role") or "备用"
+        row_endpoint = primary.get("endpoint") or ""
+        row_model = primary.get("default_model") or ""
+        row_format = primary.get("api_format") or ""
+    else:
+        bindings = None
+        row_app_type = provider_data.get("app_type", "claude")
+        row_role = provider_data.get("role", "备用")
+        row_endpoint = provider_data.get("endpoint", "")
+        row_model = provider_data.get("default_model", "")
+        row_format = provider_data.get("api_format", "")
 
     with get_connection() as conn:
         cursor = conn.cursor()
@@ -248,26 +441,45 @@ def add_provider(provider_data: Dict[str, Any]) -> int:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             provider_data.get("name", ""),
-            provider_data.get("app_type", "claude"),
-            provider_data.get("role", "备用"),
-            provider_data.get("endpoint", ""),
+            row_app_type,
+            row_role,
+            row_endpoint,
             api_key,
             provider_data.get("website", ""),
             provider_data.get("category", ""),
             provider_data.get("notes", ""),
-            provider_data.get("default_model", ""),
-            provider_data.get("api_format", ""),
+            row_model,
+            row_format,
             provider_data.get("status", "pending"),
             now,
             now,
         ))
-        return cursor.lastrowid
+        pid = cursor.lastrowid
+
+        if bindings is not None:
+            for b in bindings:
+                cursor.execute(
+                    "INSERT INTO provider_apps (provider_id, app_type, endpoint, default_model, api_format, reasoning_effort, context_length, role) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (pid, b.get("app_type"), b.get("endpoint") or "", b.get("default_model") or "",
+                     b.get("api_format") or "", b.get("reasoning_effort") or "", b.get("context_length") or 0,
+                     b.get("role") or "备用"),
+                )
+        else:
+            cursor.execute(
+                "INSERT INTO provider_apps (provider_id, app_type, endpoint, default_model, api_format, reasoning_effort, context_length, role) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (pid, row_app_type, row_endpoint, row_model, row_format, "", 0, row_role),
+            )
+        _sync_provider_mirrors(cursor, pid)
+        return pid
 
 
 def update_provider(provider_id: int, provider_data: Dict[str, Any]) -> bool:
-    """更新供应商信息（API Key 自动加密存储）"""
-    # 校验字段白名单
-    invalid = set(provider_data.keys()) - UPDATABLE_FIELDS - {"id"}
+    """更新供应商信息（API Key 自动加密存储）
+    支持 `apps`：整体替换每应用绑定（删除已移除、upsert 保留的，role 保持不变）。"""
+    # 校验字段白名单（apps 单独处理）
+    invalid = set(provider_data.keys()) - UPDATABLE_FIELDS - {"id", "apps"}
     if invalid:
         raise ValueError(f"非法字段: {', '.join(invalid)}")
 
@@ -275,6 +487,8 @@ def update_provider(provider_id: int, provider_data: Dict[str, Any]) -> bool:
     data = dict(provider_data)
     if "api_key" in data and data["api_key"]:
         data["api_key"] = _encrypt_api_key(data["api_key"])
+
+    apps = data.pop("apps", None)
 
     now = int(time.time())
     with get_connection() as conn:
@@ -293,6 +507,36 @@ def update_provider(provider_id: int, provider_data: Dict[str, Any]) -> bool:
         cursor.execute(f"""
             UPDATE providers SET {', '.join(fields)} WHERE id = ?
         """, values)
+
+        if apps is not None:
+            bindings = [b for b in apps if isinstance(b, dict) and b.get("app_type") in ("claude", "codex")]
+            if not bindings:
+                bindings = [{
+                    "app_type": "claude",
+                    "endpoint": data.get("endpoint", ""),
+                    "default_model": data.get("default_model", ""),
+                    "api_format": data.get("api_format", ""),
+                }]
+            keep_types = [b.get("app_type") for b in bindings]
+            if "claude" not in keep_types:
+                cursor.execute("DELETE FROM provider_apps WHERE provider_id=? AND app_type='claude'", (provider_id,))
+            if "codex" not in keep_types:
+                cursor.execute("DELETE FROM provider_apps WHERE provider_id=? AND app_type='codex'", (provider_id,))
+            for b in bindings:
+                # 保留已有 role（设为当前由 set_current 管理，表单不覆盖）
+                cursor.execute(
+                    "INSERT INTO provider_apps (provider_id, app_type, endpoint, default_model, api_format, reasoning_effort, context_length, role) "
+                    "VALUES (?,?,?,?,?,?,?,'备用') "
+                    "ON CONFLICT(provider_id, app_type) DO UPDATE SET "
+                    "endpoint=excluded.endpoint, default_model=excluded.default_model, api_format=excluded.api_format, "
+                    "reasoning_effort=excluded.reasoning_effort, context_length=excluded.context_length",
+                    (provider_id, b.get("app_type"), b.get("endpoint") or "",
+                     b.get("default_model") or "", b.get("api_format") or "",
+                     b.get("reasoning_effort") or "", b.get("context_length") or 0),
+                )
+            # 同步 providers 镜像列（app_type/role/endpoint/default_model/api_format）
+            _sync_provider_mirrors(cursor, provider_id)
+
         return cursor.rowcount > 0
 
 
@@ -479,6 +723,7 @@ DEFAULT_SETTINGS = {
     "test_retries": "2",              # 重试次数
     "ssl_verify": "1",                # SSL 验证
     "auto_sync_claude_on_startup": "1",  # 启动时自动同步 Claude Code 当前配置为供应商 1=开启 0=关闭
+    "auto_sync_codex_on_startup": "1",   # 启动时自动同步 Codex 当前配置为供应商 1=开启 0=关闭
 }
 
 

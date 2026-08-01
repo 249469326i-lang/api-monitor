@@ -4,12 +4,15 @@
 
 import sqlite3
 import os
+import glob
 import json
 import shutil
 import subprocess
 import sys
 import hashlib
 import datetime
+import re
+import tomllib
 from typing import List, Dict, Any, Optional
 from . import db
 
@@ -44,8 +47,8 @@ def _extract_provider_from_ccswitch_row(row_dict: dict) -> Optional[dict]:
         return None
 
     app_type = row_dict.get("app_type") or "claude"
-    # 只导入 claude 类型
-    if app_type != "claude":
+    # 只导入 claude / codex 类型
+    if app_type not in ("claude", "codex"):
         return None
     is_current = bool(row_dict.get("is_current"))
     role = "当前" if is_current else "备用"
@@ -64,6 +67,7 @@ def _extract_provider_from_ccswitch_row(row_dict: dict) -> Optional[dict]:
     endpoint = ""
     api_key = ""
     default_model = ""
+    codex_api_format = ""
 
     env = sc.get("env", {}) if isinstance(sc, dict) else {}
     if not isinstance(env, dict):
@@ -82,6 +86,7 @@ def _extract_provider_from_ccswitch_row(row_dict: dict) -> Optional[dict]:
         endpoint = (env.get("OPENAI_BASE_URL") or env.get("ANTHROPIC_BASE_URL") or "").strip()
         api_key = (env.get("OPENAI_API_KEY") or env.get("ANTHROPIC_API_KEY") or "").strip()
         default_model = (env.get("OPENAI_MODEL") or env.get("ANTHROPIC_MODEL") or "").strip()
+        codex_api_format = "openai_responses"
     elif app_type == "gemini":
         endpoint = (env.get("GEMINI_BASE_URL") or env.get("GOOGLE_BASE_URL") or "").strip()
         api_key = (env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY") or "").strip()
@@ -92,6 +97,7 @@ def _extract_provider_from_ccswitch_row(row_dict: dict) -> Optional[dict]:
         api_key = (env.get("API_KEY") or env.get("KEY") or "").strip()
         default_model = (env.get("MODEL") or "").strip()
 
+    api_format = codex_api_format if app_type == "codex" else ""
     return {
         "name": name,
         "app_type": app_type,
@@ -102,6 +108,7 @@ def _extract_provider_from_ccswitch_row(row_dict: dict) -> Optional[dict]:
         "category": row_dict.get("category") or "",
         "notes": row_dict.get("notes") or "",
         "default_model": default_model,
+        "api_format": api_format,
         "status": "pending",
     }
 
@@ -175,8 +182,8 @@ def import_from_path(db_path: str) -> Dict[str, Any]:
                     continue
             else:
                 # 简化 schema: 直接读顶层的 endpoint/api_key 等
-                # 只导入 claude 类型
-                if (row_dict.get("app_type") or "claude") != "claude":
+                # 只导入 claude / codex 类型
+                if (row_dict.get("app_type") or "claude") not in ("claude", "codex"):
                     skipped_count += 1
                     continue
                 name = (row_dict.get("name") or "").strip()
@@ -305,6 +312,150 @@ def launch_claude_code() -> Dict[str, Any]:
         }
 
 
+def _get_current_codex_provider() -> Optional[Dict[str, Any]]:
+    """当前 codex 绑定 role=当前的供应商,没有则返回 None。"""
+    for p in db.get_providers():
+        for b in p.get("apps") or []:
+            if b.get("app_type") == "codex" and b.get("role") == "当前":
+                return p
+    return None
+
+
+def _find_codex_executable() -> Optional[str]:
+    """
+    定位真实的 codex 可执行文件路径。
+
+    优先真实 .exe: OpenAI/ChatGPT 桌面版安装的
+    %LOCALAPPDATA%\\OpenAI\\Codex\\bin\\<hash>\\codex.exe。
+    PATH 上的 `codex` 常是 npm 的 .cmd shim, CreateProcess / Windows Terminal
+    无法直接执行(.cmd 需经 cmd.exe), 直接按裸命令名启动会报
+    "[WinError 2] 系统找不到指定的文件"(0x80070002)。
+
+    Returns:
+        codex 可执行文件路径; 找不到返回 None(此时调用方可用 npx 兜底)。
+    """
+    # 1. OpenAI/ChatGPT 桌面版安装的 codex.exe
+    try:
+        pattern = os.path.expandvars(r"%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe")
+        matches = sorted(glob.glob(pattern), reverse=True)
+        if matches:
+            return matches[0]
+    except Exception:
+        pass
+
+    # 2. PATH 上的真实 codex.exe
+    exe = shutil.which("codex.exe")
+    if exe:
+        return exe
+
+    # 3. PATH 上的 codex(可能是 .cmd shim, 调用方需经 cmd.exe 执行)
+    return shutil.which("codex") or None
+
+
+def launch_codex() -> Dict[str, Any]:
+    """
+    启动 Codex CLI。
+
+    Windows 优先: 定位真实 codex.exe(桌面版 %LOCALAPPDATA%\\OpenAI\\Codex\\bin)后
+    通过 Windows Terminal 复用窗口启动, 避免 npm 的 .cmd shim 无法被 wt 直接执行。
+    把当前 Codex 供应商的 API Key 注入子进程环境。
+    失败则回退到直接启动 codex.exe / cmd /c codex / npx。
+
+    Returns:
+        启动结果
+    """
+    env = dict(os.environ)
+    current = _get_current_codex_provider()
+    api_key = (current.get("api_key") or "").strip() if current else ""
+    if api_key:
+        env["OPENAI_API_KEY"] = api_key
+
+    try:
+        if sys.platform == "win32":
+            exe = _find_codex_executable()
+            wt = shutil.which("wt") or shutil.which("wt.exe")
+            if wt and exe and exe.lower().endswith(".exe"):
+                # 用绝对路径, 不再依赖 PATH 上的 codex(.cmd shim)
+                cmd = [wt, "-w", "0", "nt", "--", exe]
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                subprocess.Popen(cmd, shell=False, creationflags=flags, env=env)
+                return {"success": True, "message": "Codex 已启动"}
+    except (FileNotFoundError, OSError):
+        pass
+
+    # 回退: 直接启动 codex
+    exe = _find_codex_executable()
+    if exe:
+        if exe.lower().endswith(".exe"):
+            commands = [[exe]]
+        else:
+            # .cmd/.bat shim 需经 cmd.exe 执行
+            commands = [["cmd", "/c", exe]]
+    else:
+        commands = [["npx", "@openai/codex"]]
+
+    for cmd in commands:
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(
+                    cmd,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                    shell=False,
+                    env=env,
+                )
+            else:
+                subprocess.Popen(cmd, start_new_session=True, env=env)
+            return {"success": True, "message": "Codex 已启动"}
+        except (FileNotFoundError, OSError):
+            continue
+
+    return {
+        "success": False,
+        "error": "未找到 Codex，请确保已安装",
+    }
+
+
+CHATGPT_DESKTOP_AUMID = "OpenAI.Codex_2p2nqsd0c76g0!App"
+
+
+def launch_chatgpt_desktop() -> Dict[str, Any]:
+    """
+    启动 ChatGPT 桌面版（Store 打包的 OpenAI.Codex 应用，即 ChatGPT + Codex 桌面端，
+    jun ma 账号所在的那个应用）。
+
+    通过 explorer.exe shell:AppsFolder 的 AUMID 启动，避免直接访问受 ACL 保护的
+    WindowsApps 目录。包族/版本更新不影响 AUMID（发布者哈希不变）。
+    回退: 若常量 AUMID 启动异常，动态解析 PackageFamilyName 再试一次。
+    """
+    aumids = [CHATGPT_DESKTOP_AUMID]
+    # 兜底: 动态解析包族名（极端情况发布者哈希变化）
+    try:
+        out = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-Command",
+                "(Get-AppxPackage -Name 'OpenAI.Codex' | "
+                "Select-Object -ExpandProperty PackageFamilyName -ErrorAction SilentlyContinue)",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        fam = (out.stdout or "").strip()
+        if fam:
+            aumids.insert(0, f"{fam}!App")
+    except Exception:
+        pass
+
+    for aumid in aumids:
+        try:
+            subprocess.Popen(
+                ["explorer.exe", f"shell:AppsFolder\\{aumid}"],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return {"success": True, "message": "ChatGPT 桌面版已启动"}
+        except (FileNotFoundError, OSError):
+            continue
+    return {"success": False, "error": "未找到 ChatGPT 桌面版应用，请确认已安装 OpenAI Codex 应用"}
+
+
 def _get_claude_settings_path() -> str:
     """获取 settings.json 路径，默认 ~/.claude/settings.json"""
     return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
@@ -318,16 +469,46 @@ def _get_claude_base_url(endpoint: str) -> str:
     return endpoint
 
 
-def set_current_provider(provider_id: int) -> Dict[str, Any]:
-    """将指定供应商设为当前 Claude Code 配置（写入 ~/.claude/settings.json）"""
+def _binding(provider: Dict[str, Any], app_type: str) -> Optional[Dict[str, Any]]:
+    """取供应商在指定应用的绑定；缺则返回 None。"""
+    for b in provider.get("apps") or []:
+        if b.get("app_type") == app_type:
+            return b
+    return None
+
+
+def _resolve_app_type(provider: Dict[str, Any], app_type: Optional[str] = None) -> str:
+    """解析要设置的应用：显式 app_type 优先；缺省按 legacy app_type；'both' 缺省取 claude(主绑定)。"""
+    if app_type:
+        return app_type.lower()
+    pa = (provider.get("app_type") or "claude").lower()
+    if pa == "codex":
+        return "codex"
+    return "claude"
+
+
+def set_current_provider(provider_id: int, app_type: Optional[str] = None) -> Dict[str, Any]:
+    """将指定供应商设为指定应用的当前配置（app_type: 'claude' | 'codex'，可空向后兼容）。"""
     provider = db.get_provider_by_id(provider_id)
     if not provider:
         return {"success": False, "error": "供应商不存在"}
+    app = _resolve_app_type(provider, app_type)
+    binding = _binding(provider, app)
+    if not binding:
+        return {"success": False, "error": f"该供应商未绑定 {app} 应用"}
+    if app == "codex":
+        return _set_codex_current(provider, binding)
+    return _set_claude_current(provider, binding)
 
-    endpoint = (provider.get("endpoint") or "").rstrip("/")
+
+def _set_claude_current(provider: Dict[str, Any], binding: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """将指定供应商设为当前 Claude Code 配置（写入 ~/.claude/settings.json）。
+    binding 为 claude 绑定（含独立端点/模型），缺省回退 provider 顶层字段。"""
+    b = binding or provider
+    endpoint = (b.get("endpoint") or "").rstrip("/")
     claude_base_url = _get_claude_base_url(endpoint)
     api_key = provider.get("api_key") or ""
-    model = provider.get("default_model") or ""
+    model = b.get("default_model") or ""
 
     if not endpoint:
         return {"success": False, "error": "未配置端点"}
@@ -351,6 +532,16 @@ def set_current_provider(provider_id: int) -> Dict[str, Any]:
         env["ANTHROPIC_AUTH_TOKEN"] = api_key
     if model:
         env["ANTHROPIC_MODEL"] = model
+    # 推理强度: Claude Code 通过 env 透传（部分代理/模型支持）
+    if reasoning_effort:
+        env["ANTHROPIC_REASONING_EFFORT"] = reasoning_effort
+    elif "ANTHROPIC_REASONING_EFFORT" in env:
+        del env["ANTHROPIC_REASONING_EFFORT"]
+    # 上下文长度: 通过 CLAUDE_CODE_MAX_OUTPUT_TOKENS 控制输出上限
+    if context_length and int(context_length) > 0:
+        env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(context_length)
+    elif "CLAUDE_CODE_MAX_OUTPUT_TOKENS" in env:
+        del env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]
     settings["env"] = env
 
     # 原子写入：先写临时文件再 os.replace，避免写入中途崩溃/并发留下半个 JSON
@@ -365,21 +556,16 @@ def set_current_provider(provider_id: int) -> Dict[str, Any]:
     except Exception as e:
         return {"success": False, "error": f"写入 settings.json 失败: {e}"}
 
-    # 更新本库 role 字段
-    try:
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE providers SET role='备用'")
-            cursor.execute("UPDATE providers SET role='当前' WHERE id=?", (provider_id,))
-    except Exception:
-        pass
+    # 更新本库 role 字段（仅同应用内），并标记为第三方模式
+    _mark_app_current(provider["id"], "claude")
+    db.set_setting("claude_current_mode", "provider")
 
     name = provider.get("name", "")
-    return {"success": True, "message": f"{name} 已设为当前配置"}
+    return {"success": True, "message": f"{name} 已设为当前 Claude Code 配置"}
 
 
 def sync_current_from_settings() -> None:
-    """启动时从 settings.json 同步当前配置到本库"""
+    """启动时从 settings.json 同步 Claude 当前模式到本库（匹配 claude 绑定，不干扰 codex）。"""
     settings_path = _get_claude_settings_path()
     if not os.path.exists(settings_path):
         return
@@ -387,30 +573,38 @@ def sync_current_from_settings() -> None:
     try:
         with open(settings_path, "r", encoding="utf-8") as f:
             settings = json.load(f)
-        env = settings.get("env", {})
+        env = settings.get("env", {}) or {}
         current_url = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/").lower()
     except Exception:
         return
 
-    if not current_url:
-        return
-
-    # 匹配 provider
     try:
-        providers = db.get_providers()
+        # settings.json 无第三方覆盖 → 官方模式
+        if not current_url:
+            db.clear_app_roles("claude")
+            db.set_setting("claude_current_mode", "official")
+            return
+
+        # 匹配 claude 绑定
         matched_id = None
-        for p in providers:
-            p_url = (p.get("endpoint") or "").rstrip("/").lower()
-            if p_url == current_url:
-                matched_id = p["id"]
+        for p in db.get_providers():
+            for b in p.get("apps") or []:
+                if b.get("app_type") != "claude":
+                    continue
+                b_url = (b.get("endpoint") or "").rstrip("/").lower()
+                if b_url == current_url:
+                    matched_id = p["id"]
+                    break
+            if matched_id:
                 break
 
-        # 更新 role
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE providers SET role='备用'")
-            if matched_id:
-                cursor.execute("UPDATE providers SET role='当前' WHERE id=?", (matched_id,))
+        if matched_id:
+            db.mark_app_current(matched_id, "claude")
+            db.set_setting("claude_current_mode", "provider")
+        else:
+            # settings.json 有第三方覆盖但库里无匹配供应商 → 仍是第三方模式，
+            # 提示用户「同步」或手动配置，而不是误判为官方。
+            db.set_setting("claude_current_mode", "provider")
     except Exception:
         pass
 
@@ -444,6 +638,348 @@ def _read_claude_effective_config() -> Dict[str, str]:
     return {"endpoint": endpoint, "api_key": api_key, "model": model}
 
 
+# ────────────────── Codex 配置支持 ──────────────────
+
+CODEX_PROVIDER_SLUG = "api_monitor"
+CODEX_ENV_KEY = "OPENAI_API_KEY"
+
+
+def _get_codex_config_path() -> str:
+    """Codex 配置路径: ~/.codex/config.toml"""
+    return os.path.join(os.path.expanduser("~"), ".codex", "config.toml")
+
+
+def _toml_encode(value) -> str:
+    """把 Python 标量编码为 TOML 值: str → 基本字符串, bool → 裸字面量。"""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _toml_set_keys(text: str, key_values: Dict[str, Any], section: Optional[str] = None) -> str:
+    """
+    在 TOML 文本中更新/插入 key = value 行,保留其余内容(注释/其它表/未知键)。
+    - section=None: 顶层(非缩进)键
+    - section="a.b": 该 [a.b] 表内的键
+    缺失的顶层键插到第一个 [ 前;缺失的表追加到文件末尾。
+    """
+    lines = text.split("\n") if text else []
+    current_section: Optional[str] = None
+    section_found = False
+    replaced = set()
+    out = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            current_section = stripped.split("]", 1)[0][1:].strip()
+            if current_section == section:
+                section_found = True
+            out.append(line)
+            continue
+        if current_section == section:
+            m = re.match(r'^(\s*)([A-Za-z0-9_-]+)\s*=', line)
+            if m and m.group(2) in key_values:
+                val = key_values[m.group(2)]
+                replaced.add(m.group(2))
+                if val is None:  # None 表示删除该键
+                    continue
+                out.append(f"{m.group(1)}{m.group(2)} = {_toml_encode(val)}")
+                continue
+        elif section is None:
+            m = re.match(r'^([A-Za-z0-9_-]+)\s*=', line)
+            if m and m.group(1) in key_values:
+                val = key_values[m.group(1)]
+                replaced.add(m.group(1))
+                if val is None:  # None 表示删除该键
+                    continue
+                out.append(f"{m.group(1)} = {_toml_encode(val)}")
+                continue
+        out.append(line)
+
+    # 顶层缺失键: 插到第一个 [ 表之前
+    if section is None:
+        missing = [k for k in key_values if k not in replaced and key_values[k] is not None]
+        if missing:
+            idx = len(out)
+            for j, l in enumerate(out):
+                if l.strip().startswith("["):
+                    idx = j
+                    break
+            insert = [f"{k} = {_toml_encode(key_values[k])}" for k in missing]
+            out[idx:idx] = insert
+
+    # 表缺失: 追加到文件末尾
+    if section is not None and not section_found:
+        out.append(f"[{section}]")
+        for k, v in key_values.items():
+            if v is None:
+                continue
+            out.append(f"  {k} = {_toml_encode(v)}")
+    # 表已存在但缺新键: 插到该表末尾(下一个 [ 之前或文件末尾)
+    elif section is not None:
+        missing = [k for k in key_values if k not in replaced and key_values[k] is not None]
+        if missing:
+            insert_idx = len(out)
+            in_section = False
+            for j, l in enumerate(out):
+                if l.strip().startswith("["):
+                    header = l.strip().split("]", 1)[0][1:].strip()
+                    if header == section:
+                        in_section = True
+                    elif in_section:
+                        insert_idx = j
+                        break
+            insert = [f"  {k} = {_toml_encode(key_values[k])}" for k in missing]
+            out[insert_idx:insert_idx] = insert
+
+    return "\n".join(out)
+
+
+def _toml_remove_section(text: str, section: str) -> str:
+    """从 TOML 文本中移除指定 [section] 及其所有缩进内容/嵌套子表，保留其它内容。"""
+    lines = text.split("\n") if text else []
+    out = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            header = stripped.split("]", 1)[0][1:].strip()
+            if header == section or header.startswith(section + "."):
+                skipping = True
+                continue
+            skipping = False
+        if skipping:
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _read_codex_effective_config() -> Dict[str, str]:
+    """
+    读取 Codex 当前生效配置: ~/.codex/config.toml 的 model / model_provider /
+    [model_providers.<active>] 块; API Key 从 env_key 对应环境变量读取。
+    返回 {"endpoint","api_key","model","provider_name"}。
+    """
+    cfg: Dict = {}
+    path = _get_codex_config_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                cfg = tomllib.load(f)
+        except Exception:
+            cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    provider_name = (cfg.get("model_provider") or "").strip()
+    model = (cfg.get("model") or "").strip()
+
+    endpoint = ""
+    env_key = ""
+    bearer_token = ""
+    providers_map = cfg.get("model_providers")
+    if provider_name and isinstance(providers_map, dict):
+        prov = providers_map.get(provider_name)
+        if isinstance(prov, dict):
+            endpoint = (prov.get("base_url") or "").strip()
+            env_key = (prov.get("env_key") or "").strip()
+            bearer_token = (prov.get("experimental_bearer_token") or "").strip()
+
+    api_key = ""
+    if env_key:
+        api_key = (os.environ.get(env_key) or "").strip()
+    if not api_key:
+        api_key = bearer_token
+    if not api_key:
+        api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+
+    return {
+        "endpoint": endpoint,
+        "api_key": api_key,
+        "model": model,
+        "provider_name": provider_name,
+    }
+
+
+def _write_codex_config(provider: Dict[str, Any], binding: Optional[Dict[str, Any]] = None) -> str:
+    """
+    把 provider 写入 ~/.codex/config.toml(仅更新 model / model_provider 与
+    [model_providers.api_monitor] 表,保留注释与其它配置)。返回写入后的文本。
+    binding 为 codex 绑定（含独立端点/模型/格式），缺省回退 provider 顶层字段。
+    """
+    path = _get_codex_config_path()
+    text = ""
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except Exception:
+            text = ""
+    if not text.strip():
+        text = ""
+
+    b = binding or provider
+    model = (b.get("default_model") or "").strip()
+    endpoint = (b.get("endpoint") or "").strip().rstrip("/")
+    name = (provider.get("name") or "").strip() or CODEX_PROVIDER_SLUG
+    reasoning_effort = (b.get("reasoning_effort") or "").strip()
+    context_length = b.get("context_length") or 0
+
+    top: Dict[str, Any] = {"model_provider": CODEX_PROVIDER_SLUG}
+    if model:
+        top["model"] = model
+    # reasoning_effort 写入顶层（Codex 会透传给支持的模型）
+    if reasoning_effort:
+        top["model_reasoning_effort"] = reasoning_effort
+    text = _toml_set_keys(text, top, section=None)
+
+    section = f"model_providers.{CODEX_PROVIDER_SLUG}"
+    section_keys: Dict[str, Any] = {
+        "name": name,
+        "base_url": endpoint,
+        "wire_api": "responses",
+        "requires_openai_auth": False,
+        # context_length: 控制 Codex 上下文窗口大小（0 = 不写入，用模型默认）
+        "context_window": int(context_length) if context_length and int(context_length) > 0 else None,
+        # 删除旧 env_key: ChatGPT 桌面版进程环境里没有该变量,会直接报
+        # "Missing environment variable: OPENAI_API_KEY"; 改为把 key 内嵌为
+        # experimental_bearer_token,任何入口(CLI / 桌面版)都不再依赖环境变量。
+        "env_key": None,
+    }
+    api_key = (provider.get("api_key") or "").strip()
+    if api_key:
+        section_keys["experimental_bearer_token"] = api_key
+    text = _toml_set_keys(text, section_keys, section=section)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+    return text
+
+
+def _set_codex_current(provider: Dict[str, Any], binding: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """将指定供应商设为当前 Codex 配置（写入 ~/.codex/config.toml）。
+    binding 为 codex 绑定（含独立端点/模型/格式），缺省回退 provider 顶层字段。"""
+    b = binding or provider
+    if not (b.get("endpoint") or "").strip():
+        return {"success": False, "error": "未配置端点"}
+    try:
+        _write_codex_config(provider, b)
+    except Exception as e:
+        return {"success": False, "error": f"写入 config.toml 失败: {e}"}
+
+    _mark_app_current(provider["id"], "codex")
+    db.set_setting("codex_current_mode", "provider")
+
+    name = provider.get("name", "")
+    return {"success": True, "message": f"{name} 已设为当前 Codex 配置"}
+
+
+# ────────────────── 官方 / 第三方模式 ──────────────────
+
+def _clear_claude_official() -> tuple:
+    """从 settings.json 的 env 删除 ANTHROPIC_* 覆盖，让 Claude Code 走官方登录账号。"""
+    settings_path = _get_claude_settings_path()
+    if not os.path.exists(settings_path):
+        return True, ""
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        if not isinstance(settings, dict):
+            settings = {}
+        env = settings.get("env", {})
+        if not isinstance(env, dict):
+            env = {}
+        for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"):
+            env.pop(key, None)
+        settings["env"] = env
+        tmp_path = settings_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, settings_path)
+        return True, ""
+    except Exception as e:
+        return False, f"写入 settings.json 失败: {e}"
+
+
+def _clear_codex_official() -> tuple:
+    """从 config.toml 清除全部第三方覆盖，让 Codex 走官方 OpenAI（auth.json 登录）：
+    - 删顶层 model_provider / model / model_catalog_json（cc-switch 残留目录会锁死模型选择器）
+    - 删整个 [model_providers.api_monitor] 表（不再定义 DeepSeek 等第三方供应商）
+    """
+    path = _get_codex_config_path()
+    text = ""
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except Exception:
+            text = ""
+    text = _toml_set_keys(
+        text,
+        {"model_provider": None, "model": None, "model_catalog_json": None},
+        section=None,
+    )
+    text = _toml_remove_section(text, "model_providers.api_monitor")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        return True, ""
+    except Exception as e:
+        return False, f"写入 config.toml 失败: {e}"
+
+
+def set_current_official(app_type: str) -> Dict[str, Any]:
+    """把指定应用设为官方模式：清除第三方覆盖，走官方登录账号。"""
+    app = (app_type or "").strip().lower()
+    if app not in ("claude", "codex"):
+        return {"success": False, "error": "无效的应用类型"}
+    if app == "claude":
+        ok, err = _clear_claude_official()
+    else:
+        ok, err = _clear_codex_official()
+    if not ok:
+        return {"success": False, "error": err}
+    db.clear_app_roles(app)
+    db.set_setting(f"{app}_current_mode", "official")
+    return {"success": True, "message": "已切换为官方账号模式"}
+
+
+def get_current_modes() -> Dict[str, Dict[str, Any]]:
+    """返回每应用的当前模式: {"claude": {"mode": 'official'|'provider', "provider_name": str|None}, ...}。
+    模式设置缺失时按绑定角色推导（有 role=当前 的绑定 → provider，否则 official）。"""
+    modes: Dict[str, Dict[str, Any]] = {}
+    for app in ("claude", "codex"):
+        provider_name = None
+        current_found = False
+        for p in db.get_providers():
+            for b in p.get("apps") or []:
+                if b.get("app_type") == app and b.get("role") == "当前":
+                    provider_name = p.get("name")
+                    current_found = True
+                    break
+            if current_found:
+                break
+        mode = (db.get_setting(f"{app}_current_mode") or "").strip()
+        if not mode:
+            # 模式设置缺失时按绑定角色推导
+            mode = "provider" if current_found else "official"
+        modes[app] = {"mode": mode, "provider_name": provider_name}
+    return modes
+
+
 def _key_fingerprint(api_key: str) -> str:
     """生成 api key 指纹:前8位 + sha256前8位,避免明文到处比对。"""
     if not api_key:
@@ -453,19 +989,19 @@ def _key_fingerprint(api_key: str) -> str:
     return f"{head}:{digest}"
 
 
-def _host_from_endpoint(endpoint: str) -> str:
+def _host_from_endpoint(endpoint: str, fallback: str = "claude") -> str:
     """从 endpoint 提取 host,用于自动命名供应商。"""
     from urllib.parse import urlparse
     raw = (endpoint or "").strip()
     if not raw:
-        return "claude"
+        return fallback
     if "://" not in raw:
         raw = "https://" + raw
     try:
         host = (urlparse(raw).netloc or "").split("@")[-1].split(":")[0].strip().lower()
     except Exception:
         host = ""
-    return host or "claude"
+    return host or fallback
 
 
 def _unique_provider_name(base: str) -> str:
@@ -479,15 +1015,9 @@ def _unique_provider_name(base: str) -> str:
     return f"{base} ({i})"
 
 
-def _mark_provider_current(provider_id: int) -> None:
-    """把指定供应商标为当前,其余标备用。"""
-    try:
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE providers SET role='备用'")
-            cursor.execute("UPDATE providers SET role='当前' WHERE id=?", (provider_id,))
-    except Exception:
-        pass
+def _mark_app_current(provider_id: int, app_type: str) -> None:
+    """把指定应用下的供应商标为当前,其余(同应用)标备用（走 provider_apps 绑定）。"""
+    db.mark_app_current(provider_id, app_type)
 
 
 def auto_detect_current_provider(force: bool = False) -> Dict[str, Any]:
@@ -524,6 +1054,8 @@ def auto_detect_current_provider(force: bool = False) -> Dict[str, Any]:
     # 指纹与上次相同则完全跳过(配置未变)——仅自动同步路径
     last_fp = db.get_setting("last_synced_claude_fingerprint") or ""
     if not force and last_fp == current_fingerprint:
+        # 配置未变但仍是第三方配置 → 确保模式标记正确
+        db.set_setting("claude_current_mode", "provider")
         return {
             "success": True,
             "action": "skipped",
@@ -537,10 +1069,15 @@ def auto_detect_current_provider(force: bool = False) -> Dict[str, Any]:
         url_match = None
         key_match = None
         for p in all_providers:
-            p_url = (p.get("endpoint") or "").rstrip("/").lower()
-            p_norm = _get_claude_base_url(p_url).rstrip("/").lower() if p_url else ""
-            if p_norm == norm_endpoint:
-                url_match = p
+            for b in p.get("apps") or []:
+                if b.get("app_type") != "claude":
+                    continue
+                b_url = (b.get("endpoint") or "").strip().lower()
+                b_norm = _get_claude_base_url(b_url).rstrip("/").lower() if b_url else ""
+                if b_norm == norm_endpoint:
+                    url_match = p
+                    break
+            if url_match:
                 break
             if key_fp and key_match is None and _key_fingerprint(p.get("api_key") or "") == key_fp:
                 key_match = p
@@ -548,18 +1085,28 @@ def auto_detect_current_provider(force: bool = False) -> Dict[str, Any]:
         # URL 命中: 同一供应商,更新差异字段并标当前
         if url_match:
             pid = url_match["id"]
+            existing_b = next((b for b in (url_match.get("apps") or []) if b.get("app_type") == "claude"), None)
+            target_b = {
+                "app_type": "claude",
+                "endpoint": store_endpoint,
+                "default_model": model,
+                "api_format": (existing_b or {}).get("api_format") or "anthropic_messages",
+            }
             update_data: Dict[str, Any] = {}
             if api_key and _key_fingerprint(api_key) != _key_fingerprint(url_match.get("api_key") or ""):
                 update_data["api_key"] = api_key
-            if model and model != (url_match.get("default_model") or ""):
-                update_data["default_model"] = model
-            # 存储统一去 /v1 的 base,与 set_current_provider 一致
-            existing_norm = _get_claude_base_url(url_match.get("endpoint") or "").rstrip("/")
-            if existing_norm != store_endpoint:
-                update_data["endpoint"] = store_endpoint
+            # 绑定确实变化才更新 apps
+            if (
+                existing_b is None
+                or (existing_b.get("endpoint") or "") != target_b["endpoint"]
+                or (existing_b.get("default_model") or "") != target_b["default_model"]
+            ):
+                apps = [dict(b) for b in (url_match.get("apps") or []) if b.get("app_type") != "claude"]
+                apps.append(target_b)
+                update_data["apps"] = apps
 
-            changed = False
-            if update_data:
+            changed = bool(update_data)
+            if changed:
                 ok, err = validators.validate_provider(update_data, is_update=True)
                 if not ok:
                     return {
@@ -570,9 +1117,9 @@ def auto_detect_current_provider(force: bool = False) -> Dict[str, Any]:
                         "message": f"更新供应商失败: {err}",
                     }
                 db.update_provider(pid, update_data)
-                changed = True
 
-            _mark_provider_current(pid)
+            _mark_app_current(pid, "claude")
+            db.set_setting("claude_current_mode", "provider")
             db.set_setting("last_synced_claude_fingerprint", current_fingerprint)
             name = url_match.get("name") or str(pid)
             if changed:
@@ -593,9 +1140,16 @@ def auto_detect_current_provider(force: bool = False) -> Dict[str, Any]:
         # key 指纹命中: 换端点但同一 key,更新已有 provider
         if key_match:
             pid = key_match["id"]
-            update_data = {"endpoint": store_endpoint}
-            if model:
-                update_data["default_model"] = model
+            apps = [dict(b) for b in (key_match.get("apps") or []) if b.get("app_type") != "claude"]
+            claude_b = next((b for b in (key_match.get("apps") or []) if b.get("app_type") == "claude"), None)
+            if claude_b is None:
+                claude_b = {"app_type": "claude", "endpoint": store_endpoint, "default_model": model, "api_format": "anthropic_messages"}
+            else:
+                claude_b["endpoint"] = store_endpoint
+                if model:
+                    claude_b["default_model"] = model
+            apps.append(claude_b)
+            update_data: Dict[str, Any] = {"apps": apps}
             if api_key:
                 update_data["api_key"] = api_key
             ok, err = validators.validate_provider(update_data, is_update=True)
@@ -608,7 +1162,8 @@ def auto_detect_current_provider(force: bool = False) -> Dict[str, Any]:
                     "message": f"更新供应商失败: {err}",
                 }
             db.update_provider(pid, update_data)
-            _mark_provider_current(pid)
+            _mark_app_current(pid, "claude")
+            db.set_setting("claude_current_mode", "provider")
             db.set_setting("last_synced_claude_fingerprint", current_fingerprint)
             name = key_match.get("name") or str(pid)
             return {
@@ -626,12 +1181,13 @@ def auto_detect_current_provider(force: bool = False) -> Dict[str, Any]:
         base_name = f"Claude · {host}"
         provider_data = {
             "name": _unique_provider_name(base_name),
-            "app_type": "claude",
-            "role": "当前",
-            "endpoint": store_endpoint,
+            "apps": [{
+                "app_type": "claude",
+                "endpoint": store_endpoint,
+                "default_model": model,
+                "api_format": "anthropic_messages",
+            }],
             "api_key": api_key,
-            "default_model": model,
-            "api_format": "anthropic_messages",
             "notes": f"同步自 Claude Code 当前配置 ({today})",
             "status": "pending",
         }
@@ -645,7 +1201,8 @@ def auto_detect_current_provider(force: bool = False) -> Dict[str, Any]:
                 "message": f"新建供应商失败: {err}",
             }
         new_id = db.add_provider(provider_data)
-        _mark_provider_current(new_id)
+        _mark_app_current(new_id, "claude")
+        db.set_setting("claude_current_mode", "provider")
         db.set_setting("last_synced_claude_fingerprint", current_fingerprint)
         return {
             "success": True,
@@ -672,6 +1229,214 @@ def sync_claude_code_provider(force: bool = True) -> Dict[str, Any]:
     不同则新建,相同则标记/更新。默认 force=True(手动导入不跳过)。
     """
     return auto_detect_current_provider(force=force)
+
+
+def auto_detect_codex_provider(force: bool = False) -> Dict[str, Any]:
+    """
+    检测 Codex 当前生效配置(~/.codex/config.toml),并与本库 codex 供应商对比:
+    - URL 匹配: 视为同一供应商,必要时更新 key/model,标为当前(不新建)。
+    - URL 未命中但 api key 指纹命中: 更新该 provider 的 endpoint/model。
+    - URL 与 key 都未命中: 新建一条 codex 供应商。
+    force=False(启动默认): 指纹与上次相同则跳过。force=True(手动导入): 始终比对。
+    """
+    from . import validators
+
+    cfg = _read_codex_effective_config()
+    endpoint = (cfg.get("endpoint") or "").strip()
+    api_key = cfg.get("api_key") or ""
+    model = cfg.get("model") or ""
+
+    if not endpoint:
+        return {
+            "success": False,
+            "action": "error",
+            "reason": "无可同步的端点",
+            "error": "未检测到 Codex 配置(无 base_url)。请检查 ~/.codex/config.toml 的 [model_providers.<name>].base_url。",
+            "message": "未检测到 Codex 配置(无 base_url)",
+        }
+
+    # Codex 的 base_url 不做去 /v1 处理: Codex 会自行追加 /responses
+    store_endpoint = endpoint.rstrip("/")
+    norm_endpoint = store_endpoint.lower()
+    key_fp = _key_fingerprint(api_key)
+    current_fingerprint = f"{norm_endpoint}|{model}|{key_fp}"
+
+    # 指纹与上次相同则完全跳过(配置未变)——仅自动同步路径
+    last_fp = db.get_setting("last_synced_codex_fingerprint") or ""
+    if not force and last_fp == current_fingerprint:
+        # 配置未变但仍是第三方配置 → 确保模式标记正确
+        db.set_setting("codex_current_mode", "provider")
+        return {
+            "success": True,
+            "action": "skipped",
+            "reason": "配置未变,跳过",
+            "message": "Codex 配置未变化,已跳过",
+            "fingerprint": current_fingerprint,
+        }
+
+    try:
+        all_providers = db.get_providers()
+        url_match = None
+        key_match = None
+        for p in all_providers:
+            for b in p.get("apps") or []:
+                if b.get("app_type") != "codex":
+                    continue
+                b_url = (b.get("endpoint") or "").strip().lower()
+                if b_url == norm_endpoint:
+                    url_match = p
+                    break
+            if url_match:
+                break
+            if key_fp and key_match is None and _key_fingerprint(p.get("api_key") or "") == key_fp:
+                key_match = p
+
+        # URL 命中: 同一供应商,更新差异字段并标当前
+        if url_match:
+            pid = url_match["id"]
+            existing_b = next((b for b in (url_match.get("apps") or []) if b.get("app_type") == "codex"), None)
+            target_b = {
+                "app_type": "codex",
+                "endpoint": store_endpoint,
+                "default_model": model,
+                "api_format": (existing_b or {}).get("api_format") or "openai_responses",
+            }
+            update_data: Dict[str, Any] = {}
+            if api_key and _key_fingerprint(api_key) != _key_fingerprint(url_match.get("api_key") or ""):
+                update_data["api_key"] = api_key
+            if (
+                existing_b is None
+                or (existing_b.get("endpoint") or "") != target_b["endpoint"]
+                or (existing_b.get("default_model") or "") != target_b["default_model"]
+            ):
+                apps = [dict(b) for b in (url_match.get("apps") or []) if b.get("app_type") != "codex"]
+                apps.append(target_b)
+                update_data["apps"] = apps
+
+            changed = bool(update_data)
+            if changed:
+                ok, err = validators.validate_provider(update_data, is_update=True)
+                if not ok:
+                    return {
+                        "success": False,
+                        "action": "error",
+                        "reason": f"校验失败: {err}",
+                        "error": err,
+                        "message": f"更新供应商失败: {err}",
+                    }
+                db.update_provider(pid, update_data)
+
+            _mark_app_current(pid, "codex")
+            db.set_setting("codex_current_mode", "provider")
+            db.set_setting("last_synced_codex_fingerprint", current_fingerprint)
+            name = url_match.get("name") or str(pid)
+            if changed:
+                msg = f"已匹配供应商「{name}」并同步 key/模型,标为当前"
+                action = "updated"
+            else:
+                msg = f"配置已存在于供应商「{name}」,已标为当前"
+                action = "exists"
+            return {
+                "success": True,
+                "action": action,
+                "reason": "URL 已存在",
+                "message": msg,
+                "provider_id": pid,
+                "fingerprint": current_fingerprint,
+            }
+
+        # key 指纹命中: 换端点但同一 key,更新已有 provider
+        if key_match:
+            pid = key_match["id"]
+            apps = [dict(b) for b in (key_match.get("apps") or []) if b.get("app_type") != "codex"]
+            codex_b = next((b for b in (key_match.get("apps") or []) if b.get("app_type") == "codex"), None)
+            if codex_b is None:
+                codex_b = {"app_type": "codex", "endpoint": store_endpoint, "default_model": model, "api_format": "openai_responses"}
+            else:
+                codex_b["endpoint"] = store_endpoint
+                if model:
+                    codex_b["default_model"] = model
+            apps.append(codex_b)
+            update_data: Dict[str, Any] = {"apps": apps}
+            if api_key:
+                update_data["api_key"] = api_key
+            ok, err = validators.validate_provider(update_data, is_update=True)
+            if not ok:
+                return {
+                    "success": False,
+                    "action": "error",
+                    "reason": f"校验失败: {err}",
+                    "error": err,
+                    "message": f"更新供应商失败: {err}",
+                }
+            db.update_provider(pid, update_data)
+            _mark_app_current(pid, "codex")
+            db.set_setting("codex_current_mode", "provider")
+            db.set_setting("last_synced_codex_fingerprint", current_fingerprint)
+            name = key_match.get("name") or str(pid)
+            return {
+                "success": True,
+                "action": "updated",
+                "reason": "key 指纹命中,已更新端点",
+                "message": f"已根据同一 API Key 更新供应商「{name}」的端点",
+                "provider_id": pid,
+                "fingerprint": current_fingerprint,
+            }
+
+        # 都未命中: 新建
+        today = datetime.date.today().isoformat()
+        host = _host_from_endpoint(store_endpoint, fallback="codex")
+        base_name = f"Codex · {host}"
+        provider_data = {
+            "name": _unique_provider_name(base_name),
+            "apps": [{
+                "app_type": "codex",
+                "endpoint": store_endpoint,
+                "default_model": model,
+                "api_format": "openai_responses",
+            }],
+            "api_key": api_key,
+            "notes": f"同步自 Codex 当前配置 ({today})",
+            "status": "pending",
+        }
+        ok, err = validators.validate_provider(provider_data, is_update=False)
+        if not ok:
+            return {
+                "success": False,
+                "action": "error",
+                "reason": f"校验失败: {err}",
+                "error": err,
+                "message": f"新建供应商失败: {err}",
+            }
+        new_id = db.add_provider(provider_data)
+        _mark_app_current(new_id, "codex")
+        db.set_setting("codex_current_mode", "provider")
+        db.set_setting("last_synced_codex_fingerprint", current_fingerprint)
+        return {
+            "success": True,
+            "action": "created",
+            "reason": "新增供应商",
+            "message": f"已新建供应商「{provider_data['name']}」并导入当前 Codex 配置",
+            "provider_id": new_id,
+            "fingerprint": current_fingerprint,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "action": "error",
+            "reason": f"异常: {e}",
+            "error": str(e),
+            "message": f"同步失败: {e}",
+        }
+
+
+def sync_codex_provider(force: bool = True) -> Dict[str, Any]:
+    """
+    导入入口: 主动读取 Codex 当前配置,与已有供应商对比,
+    不同则新建,相同则标记/更新。默认 force=True(手动导入不跳过)。
+    """
+    return auto_detect_codex_provider(force=force)
 
 
 def _format_provider(p: Dict) -> Dict[str, Any]:
@@ -712,6 +1477,17 @@ def _format_provider(p: Dict) -> Dict[str, Any]:
         "default_model": p.get("default_model", ""),
         "last_test_time": p.get("last_test_time"),
         "created_at": p.get("created_at"),
+        # 每应用绑定（分页过滤用）：[{app_type,endpoint,default_model,api_format,role}]
+        "apps": [
+            {
+                "app_type": b.get("app_type"),
+                "endpoint": b.get("endpoint", ""),
+                "default_model": b.get("default_model", ""),
+                "api_format": b.get("api_format", ""),
+                "role": b.get("role", "备用"),
+            }
+            for b in (p.get("apps") or [])
+        ],
     }
 
 
@@ -730,7 +1506,7 @@ def get_provider_list_formatted() -> List[Dict[str, Any]]:
 def get_provider_key(provider_id: int) -> Dict[str, Any]:
     """按 ID 返回单个供应商的明文 API Key（仅供前端复制/显示时按需调用）"""
     try:
-        p = db.get_provider(int(provider_id))
+        p = db.get_provider_by_id(int(provider_id))
     except (TypeError, ValueError):
         return {"success": False, "error": "无效的供应商 ID"}
     if not p:

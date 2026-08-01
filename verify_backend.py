@@ -181,6 +181,56 @@ def main():
     else:
         failed += 1
 
+    # 14. launch_codex - 只验证方法存在且可调用
+    ok = callable(getattr(api, "launch_codex", None))
+    if step("launch_codex_exists", ok):
+        passed += 1
+    else:
+        failed += 1
+
+    # 15. sync_codex_provider - 隔离环境/无 config.toml 都不应抛异常;
+    # 有真实 ~/.codex/config.toml 时会在隔离 DB 中同步,同样合法
+    try:
+        cx_r = api.sync_codex_provider()
+        ok = isinstance(cx_r, dict) and "action" in cx_r
+        if step("sync_codex_provider_no_crash", ok, str(cx_r)):
+            passed += 1
+        else:
+            failed += 1
+    except Exception as e:
+        if step("sync_codex_provider_no_crash", False, str(e)):
+            passed += 1
+        else:
+            failed += 1
+
+    # 16. get_current_modes - 返回 per-app 模式结构
+    try:
+        modes_r = api.get_current_modes()
+        modes = modes_r.get("data") if modes_r and modes_r.get("success") else {}
+        ok = (
+            isinstance(modes_r, dict) and modes_r.get("success")
+            and isinstance(modes, dict)
+            and "claude" in modes and "codex" in modes
+            and modes["claude"].get("mode") in ("official", "provider")
+        )
+        if step("get_current_modes", ok, str(modes_r)):
+            passed += 1
+        else:
+            failed += 1
+    except Exception as e:
+        if step("get_current_modes", False, str(e)):
+            passed += 1
+        else:
+            failed += 1
+
+    # 17. set_current_official - 无效应用类型应明确失败,不抛异常
+    bad_r = api.set_current_official("bogus")
+    ok = isinstance(bad_r, dict) and not bad_r.get("success") and bad_r.get("error")
+    if step("set_current_official_invalid_app", ok, str(bad_r)):
+        passed += 1
+    else:
+        failed += 1
+
     print(f"\n=== 结果: {passed} passed / {failed} failed ===")
     return 0 if failed == 0 else 1
 

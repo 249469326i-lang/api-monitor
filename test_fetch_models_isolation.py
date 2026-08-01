@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import tomllib
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -646,6 +647,306 @@ class ChatEndpointTest(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["api_format"], "openai_chat")
         self.assertEqual(calls[0], "https://proxy.example/v1/chat/completions")
+
+
+class CodexConfigTest(unittest.TestCase):
+    """Codex 应用支持: 设当前 / 同步 / 按 app_type 独立「当前」标记。"""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._old_appdata = os.environ.get("APPDATA")
+        self._old_userprofile = os.environ.get("USERPROFILE")
+        self._old_home = os.environ.get("HOME")
+        self._old_data_dir = os.environ.get("API_MONITOR_DATA_DIR")
+        os.environ["APPDATA"] = os.path.join(self._tmp, "appdata")
+        os.environ["USERPROFILE"] = self._tmp
+        os.environ["HOME"] = self._tmp
+        os.environ["API_MONITOR_DATA_DIR"] = os.path.join(self._tmp, "data")
+        db.init_db()
+
+    def tearDown(self):
+        if self._old_appdata is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = self._old_appdata
+        if self._old_userprofile is None:
+            os.environ.pop("USERPROFILE", None)
+        else:
+            os.environ["USERPROFILE"] = self._old_userprofile
+        if self._old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._old_home
+        if self._old_data_dir is None:
+            os.environ.pop("API_MONITOR_DATA_DIR", None)
+        else:
+            os.environ["API_MONITOR_DATA_DIR"] = self._old_data_dir
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _codex_config_path(self):
+        return os.path.join(self._tmp, ".codex", "config.toml")
+
+    def _seed_codex_config(self, base_url="https://api.picpi.top", model="gpt-5.6-sol"):
+        cfg = (
+            "# codex config\n"
+            'model_provider = "custom"\n'
+            f'model = "{model}"\n'
+            "\n"
+            "[model_providers.custom]\n"
+            'name = "旧供应商"\n'
+            f'base_url = "{base_url}"\n'
+            'wire_api = "responses"\n'
+            "requires_openai_auth = true\n"
+            "\n"
+            "[mcp_servers.foo]\n"
+            'command = "echo hi"\n'
+            "\n"
+            "[desktop]\n"
+            'theme = "light"\n'
+        )
+        path = self._codex_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(cfg)
+        return path
+
+    def test_set_codex_current_writes_config_toml(self):
+        pid = db.add_provider(
+            {
+                "name": "Picpi",
+                "app_type": "codex",
+                "endpoint": "https://api.picpi.top",
+                "api_key": "sk-test-123",
+                "default_model": "gpt-5.6-sol",
+                "api_format": "openai_responses",
+            }
+        )
+        result = providers.set_current_provider(pid)
+        self.assertTrue(result["success"])
+        self.assertTrue(os.path.exists(self._codex_config_path()))
+        with open(self._codex_config_path(), "r", encoding="utf-8") as f:
+            parsed = tomllib.loads(f.read())
+        self.assertEqual(parsed["model_provider"], "api_monitor")
+        self.assertEqual(parsed["model"], "gpt-5.6-sol")
+        section = parsed["model_providers"]["api_monitor"]
+        self.assertEqual(section["base_url"], "https://api.picpi.top")
+        self.assertNotIn("env_key", section)
+        self.assertEqual(section["experimental_bearer_token"], "sk-test-123")
+        self.assertEqual(section["wire_api"], "responses")
+        self.assertIs(section["requires_openai_auth"], False)
+        self.assertEqual(section["name"], "Picpi")
+        # 供应商被标为当前
+        self.assertEqual(db.get_provider_by_id(pid)["role"], "当前")
+
+    def test_set_codex_current_preserves_unrelated_content(self):
+        self._seed_codex_config()
+        pid = db.add_provider(
+            {
+                "name": "Picpi",
+                "app_type": "codex",
+                "endpoint": "https://api.picpi.top",
+                "default_model": "gpt-5.6-sol",
+            }
+        )
+        providers.set_current_provider(pid)
+        with open(self._codex_config_path(), "r", encoding="utf-8") as f:
+            cfg = f.read()
+        # 注释、mcp_servers、desktop 与旧 provider 表都保留
+        self.assertIn("# codex config", cfg)
+        self.assertIn("[mcp_servers.foo]", cfg)
+        self.assertIn('command = "echo hi"', cfg)
+        self.assertIn('theme = "light"', cfg)
+        self.assertIn("model_providers.custom", cfg)
+        # 新表已写入
+        self.assertIn("model_providers.api_monitor", cfg)
+
+    def test_sync_codex_creates_provider(self):
+        self._seed_codex_config(base_url="https://api.codexproxy.example/v1", model="gpt-5")
+        result = providers.sync_codex_provider(force=True)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["action"], "created")
+        p = db.get_provider_by_id(result["provider_id"])
+        self.assertEqual(p["app_type"], "codex")
+        self.assertEqual(p["endpoint"], "https://api.codexproxy.example/v1")
+        self.assertEqual(p["default_model"], "gpt-5")
+        self.assertEqual(p["api_format"], "openai_responses")
+        self.assertEqual(p["role"], "当前")
+
+    def test_sync_codex_matches_existing_and_marks_current(self):
+        self._seed_codex_config()
+        pid = db.add_provider(
+            {
+                "name": "已有",
+                "app_type": "codex",
+                "endpoint": "https://api.picpi.top",
+                "default_model": "gpt-5.6-sol",
+                "role": "备用",
+            }
+        )
+        result = providers.sync_codex_provider(force=True)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["action"], "exists")
+        self.assertEqual(result["provider_id"], pid)
+        self.assertEqual(db.get_provider_by_id(pid)["role"], "当前")
+
+    def test_sync_codex_missing_config_graceful(self):
+        result = providers.sync_codex_provider(force=True)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["action"], "error")
+
+    def test_claude_and_codex_current_coexist(self):
+        claude_id = db.add_provider(
+            {
+                "name": "Claude A",
+                "app_type": "claude",
+                "endpoint": "https://claude.example",
+                "api_key": "sk-c",
+            }
+        )
+        self.assertTrue(providers.set_current_provider(claude_id)["success"])
+
+        codex_id = db.add_provider(
+            {
+                "name": "Codex B",
+                "app_type": "codex",
+                "endpoint": "https://codex.example",
+                "api_key": "sk-x",
+            }
+        )
+        self.assertTrue(providers.set_current_provider(codex_id)["success"])
+
+        self.assertEqual(db.get_provider_by_id(claude_id)["role"], "当前")
+        self.assertEqual(db.get_provider_by_id(codex_id)["role"], "当前")
+
+        # 同步 Claude settings 不应动 codex 的当前标记
+        providers.sync_current_from_settings()
+        self.assertEqual(db.get_provider_by_id(codex_id)["role"], "当前")
+        self.assertEqual(db.get_provider_by_id(claude_id)["role"], "当前")
+
+    def test_dual_app_provider_independent_config(self):
+        """同一供应商绑定 claude+codex，两端独立端点/模型/角色互不干扰。"""
+        pid = db.add_provider(
+            {
+                "name": "DeepSeek",
+                "apps": [
+                    {"app_type": "claude", "endpoint": "https://api.deepseek.com/anthropic", "default_model": "deepseek-chat", "api_format": "anthropic_messages"},
+                    {"app_type": "codex", "endpoint": "https://api.deepseek.com/v1", "default_model": "deepseek-v4-flash", "api_format": "openai_responses"},
+                ],
+                "api_key": "sk-dual",
+            }
+        )
+        p = db.get_provider_by_id(pid)
+        self.assertEqual(p["app_type"], "both")
+
+        # 双端各自设为当前
+        self.assertTrue(providers.set_current_provider(pid, "claude")["success"])
+        self.assertTrue(providers.set_current_provider(pid, "codex")["success"])
+
+        # settings.json 用 claude 端点
+        settings_path = os.path.join(self._tmp, ".claude", "settings.json")
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        self.assertEqual(settings["env"]["ANTHROPIC_BASE_URL"], "https://api.deepseek.com/anthropic")
+        self.assertEqual(settings["env"]["ANTHROPIC_MODEL"], "deepseek-chat")
+
+        # config.toml 用 codex 端点
+        with open(self._codex_config_path(), "r", encoding="utf-8") as f:
+            cfg = tomllib.loads(f.read())
+        self.assertEqual(cfg["model_provider"], "api_monitor")
+        self.assertEqual(cfg["model"], "deepseek-v4-flash")
+        self.assertEqual(cfg["model_providers"]["api_monitor"]["base_url"], "https://api.deepseek.com/v1")
+
+        # 两应用绑定各自 role=当前，互不干扰
+        p2 = db.get_provider_by_id(pid)
+        claude_b = next(b for b in p2["apps"] if b["app_type"] == "claude")
+        codex_b = next(b for b in p2["apps"] if b["app_type"] == "codex")
+        self.assertEqual(claude_b["role"], "当前")
+        self.assertEqual(codex_b["role"], "当前")
+
+        # 当前模式标记
+        modes = providers.get_current_modes()
+        self.assertEqual(modes["claude"]["mode"], "provider")
+        self.assertEqual(modes["claude"]["provider_name"], "DeepSeek")
+        self.assertEqual(modes["codex"]["mode"], "provider")
+        self.assertEqual(modes["codex"]["provider_name"], "DeepSeek")
+
+    def test_set_current_official_removes_config(self):
+        """官方模式: codex 删顶层 model_provider/model，claude 删 ANTHROPIC_* 覆盖。"""
+        pid = db.add_provider(
+            {
+                "name": "Picpi",
+                "apps": [
+                    {"app_type": "claude", "endpoint": "https://api.picpi.top/anthropic", "default_model": "deepseek-chat"},
+                    {"app_type": "codex", "endpoint": "https://api.picpi.top/v1", "default_model": "deepseek-v4-flash"},
+                ],
+                "api_key": "sk-test-123",
+            }
+        )
+        self.assertTrue(providers.set_current_provider(pid, "claude")["success"])
+        self.assertTrue(providers.set_current_provider(pid, "codex")["success"])
+
+        # codex 切官方: 删顶层 model_provider / model / model_catalog_json，
+        # 并删除整个 [model_providers.api_monitor] 第三方表，其它内容保留
+        self.assertTrue(providers.set_current_official("codex")["success"])
+        with open(self._codex_config_path(), "r", encoding="utf-8") as f:
+            cfg_text = f.read()
+        parsed = tomllib.loads(cfg_text)
+        self.assertNotIn("model_provider", parsed)
+        self.assertNotIn("model", parsed)
+        self.assertNotIn("model_catalog_json", parsed)
+        self.assertNotIn("model_providers.api_monitor", cfg_text)  # 第三方供应商表已删除
+        p = db.get_provider_by_id(pid)
+        codex_b = next(b for b in p["apps"] if b["app_type"] == "codex")
+        self.assertEqual(codex_b["role"], "备用")
+        self.assertEqual(providers.get_current_modes()["codex"]["mode"], "official")
+
+        # claude 切官方: settings.json env 删除 ANTHROPIC_*
+        self.assertTrue(providers.set_current_official("claude")["success"])
+        settings_path = os.path.join(self._tmp, ".claude", "settings.json")
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        env = settings.get("env", {})
+        self.assertNotIn("ANTHROPIC_BASE_URL", env)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+        self.assertNotIn("ANTHROPIC_MODEL", env)
+        p2 = db.get_provider_by_id(pid)
+        claude_b = next(b for b in p2["apps"] if b["app_type"] == "claude")
+        self.assertEqual(claude_b["role"], "备用")
+        self.assertEqual(providers.get_current_modes()["claude"]["mode"], "official")
+
+    def test_current_modes_derives_from_binding_when_setting_missing(self):
+        """模式设置缺失时，get_current_modes 按绑定角色推导。"""
+        pid = db.add_provider({"name": "X", "app_type": "codex", "endpoint": "https://x.example/v1", "api_key": "sk-x"})
+        self.assertTrue(providers.set_current_provider(pid, "codex")["success"])
+        # 人为清掉模式设置 → 从绑定推导为 provider
+        db.set_setting("codex_current_mode", "")
+        modes = providers.get_current_modes()
+        self.assertEqual(modes["codex"]["mode"], "provider")
+        self.assertEqual(modes["codex"]["provider_name"], "X")
+        # 没有当前绑定 → 推导为 official
+        db.set_setting("codex_current_mode", "")
+        providers.set_current_official("codex")
+        modes = providers.get_current_modes()
+        self.assertEqual(modes["codex"]["mode"], "official")
+        self.assertIsNone(modes["codex"]["provider_name"])
+
+    def test_sync_settings_unmatched_override_stays_provider(self):
+        """settings.json 有第三方覆盖但库里无匹配供应商 → 保持第三方模式而非误判官方。"""
+        settings_path = os.path.join(self._tmp, ".claude", "settings.json")
+        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump({"env": {"ANTHROPIC_BASE_URL": "https://unknown.example"}}, f)
+        providers.sync_current_from_settings()
+        modes = providers.get_current_modes()
+        self.assertEqual(modes["claude"]["mode"], "provider")
+        self.assertIsNone(modes["claude"]["provider_name"])
+
+        # 无第三方覆盖 → 官方
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump({"env": {}}, f)
+        providers.sync_current_from_settings()
+        self.assertEqual(providers.get_current_modes()["claude"]["mode"], "official")
 
 
 if __name__ == "__main__":

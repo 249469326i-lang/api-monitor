@@ -13,7 +13,7 @@
         @font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 600; font-display: swap; src: url('assets/fonts/ibm-plex-mono-600.woff2') format('woff2'); }
         @font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 700; font-display: swap; src: url('assets/fonts/ibm-plex-mono-700.woff2') format('woff2'); }
     </style>
-    <link rel="stylesheet" href="css/style.css?v=20260726-local-fonts">
+    <link rel="stylesheet" href="css/style.css?v=20260801-reasoning-ctx-v2">
 </head>
 <body>
     <div class="app">
@@ -56,12 +56,19 @@
 
             <div class="nav-spacer pywebview-drag-region"></div>
 
-            <button class="nav-dashboard" id="launchBtn">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
-                </svg>
-                启动服务
-            </button>
+            <div class="nav-menu nav-menu-inline" id="launchMenu">
+                <button class="nav-dashboard nav-menu-label" id="launchBtn" title="启动服务">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                    </svg>
+                    启动服务
+                </button>
+                <div class="menu-inline" id="launchDropdown">
+                    <div class="menu-option" data-target="claude">Claude Code</div>
+                    <div class="menu-option" data-target="codex-cli">Codex CLI</div>
+                    <div class="menu-option" data-target="chatgpt-desktop">ChatGPT 桌面版</div>
+                </div>
+            </div>
 
             <div class="nav-avatar" id="settingsAvatar" title="设置">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -162,6 +169,17 @@
                     <div class="plc-header">
                         <div class="plc-title">NODE LIST <span class="plc-count mono" id="providerCount">0 NODES</span></div>
                     </div>
+                    <!-- 应用分页：Claude Code / Codex -->
+                    <div class="app-tabs" id="appTabs">
+                        <button class="app-tab active" data-app="claude">CLAUDE CODE</button>
+                        <button class="app-tab" data-app="codex">CODEX</button>
+                    </div>
+                    <!-- 每应用模式条：官方 / 第三方 -->
+                    <div class="mode-bar" id="modeBar">
+                        <button class="mode-btn active" data-mode="official">官方</button>
+                        <button class="mode-btn" data-mode="provider">第三方</button>
+                        <span class="mode-cur mono" id="modeCur">—</span>
+                    </div>
                     <div class="plc-toolbar">
                         <button class="tb-btn tb-cta" id="fastTestBtn" title="快速测试 (T)">
                             ⚡ 快速测试
@@ -175,7 +193,13 @@
                         <div class="tb-sep"></div>
                         <button class="tb-btn" id="refreshBtn" title="刷新">刷新</button>
                         <button class="tb-btn" id="addBtn" title="新增">+ 新增</button>
-                        <button class="tb-btn" id="importBtn" title="同步当前 Claude Code 配置到供应商列表">同步</button>
+                        <div class="tb-menu" id="importMenu">
+                            <button class="tb-btn" id="importBtn" title="同步当前配置到供应商列表">同步</button>
+                            <div class="menu-dropdown" id="importDropdown">
+                                <div class="menu-option" data-target="claude">同步 Claude Code</div>
+                                <div class="menu-option" data-target="codex">同步 Codex</div>
+                            </div>
+                        </div>
                         <div class="toolbar-right">
                             <button class="tb-btn" id="selectModeBtn" title="多选">选择</button>
                         </div>
@@ -248,6 +272,7 @@
                                 <div class="empty-actions">
                                     <button type="button" class="tb-btn tb-cta" id="emptyAddBtn">+ ADD</button>
                                     <button type="button" class="tb-btn" id="emptyImportBtn">SYNC CC</button>
+                                    <button type="button" class="tb-btn" id="emptyImportCodexBtn">SYNC CODEX</button>
                                     <button type="button" class="tb-btn" id="emptyTestBtn">⚡ TEST</button>
                                 </div>
                                 <div class="empty-cli mono" id="emptyCliPreview" aria-hidden="true">
@@ -259,6 +284,7 @@
                                 <div class="empty-hint" id="emptyHint" style="display:none;">
                                     还没有提供商，点击 <a href="#" id="emptyAddLink">新增</a> 或
                                     <a href="#" id="emptyImportLink">同步 Claude Code 配置</a>
+                                    / <a href="#" id="emptyImportCodexLink">同步 Codex 配置</a>
                                 </div>
                             </div>
                         </div>
@@ -310,37 +336,158 @@
                     <label>名称 <span class="req">*</span></label>
                     <input type="text" id="fName" placeholder="例：OpenRouter">
                 </div>
-                <div class="form-grid-2">
-                    <div class="form-row">
-                        <label>应用类型</label>
-                        <div class="custom-select" id="fAppType" data-value="claude">
-                            <div class="custom-select-display">
-                                <span class="custom-select-text">claude</span>
-                                <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                            </div>
-                            <div class="custom-select-dropdown">
-                                <div class="custom-select-option" data-value="claude">claude</div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="form-row">
-                        <label>角色</label>
-                        <div class="custom-select" id="fRole" data-value="备用">
-                            <div class="custom-select-display">
-                                <span class="custom-select-text">备用</span>
-                                <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                            </div>
-                            <div class="custom-select-dropdown">
-                                <div class="custom-select-option" data-value="备用">备用</div>
-                                <div class="custom-select-option" data-value="当前">当前</div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
                 <div class="form-row">
-                    <label>端点 URL <span class="req">*</span></label>
-                    <input type="text" id="fEndpoint" placeholder="https://api.example.com/v1">
+                    <label>应用 <span class="req">*</span></label>
+                    <div class="app-check-row">
+                        <label class="app-check"><input type="checkbox" id="fAppClaude" checked><span class="toggle-box"></span><span>Claude Code</span></label>
+                        <label class="app-check"><input type="checkbox" id="fAppCodex"><span class="toggle-box"></span><span>Codex</span></label>
+                    </div>
                 </div>
+
+                <!-- Claude Code 输入组 -->
+                <div class="app-fields" data-app="claude">
+                    <div class="app-fields-head"><span class="app-fields-tag">CLAUDE CODE</span></div>
+                    <div class="form-row">
+                        <label>端点 URL <span class="req">*</span></label>
+                        <input type="text" id="fEndpointClaude" placeholder="https://api.deepseek.com/anthropic">
+                    </div>
+                    <div class="form-grid-2">
+                        <div class="form-row" style="position:relative;">
+                            <label>默认模型</label>
+                            <div class="model-input-group">
+                                <input type="text" id="fDefaultModelClaude" placeholder="deepseek-chat">
+                                <button type="button" class="btn-fetch-models" data-app="claude" title="从端点获取模型列表">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                        <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                                    </svg>
+                                </button>
+                            </div>
+                            <div class="model-dropdown" id="modelDropdownClaude" style="display:none;"></div>
+                        </div>
+                        <div class="form-row">
+                            <label>API 格式</label>
+                            <div class="custom-select" id="fApiFormatClaude" data-value="anthropic_messages">
+                                <div class="custom-select-display">
+                                    <span class="custom-select-text">Anthropic Messages</span>
+                                    <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                </div>
+                                <div class="custom-select-dropdown">
+                                    <div class="custom-select-option" data-value="">自动检测</div>
+                                    <div class="custom-select-option" data-value="anthropic_messages">Anthropic Messages</div>
+                                    <div class="custom-select-option" data-value="openai_chat">OpenAI Chat Completions</div>
+                                    <div class="custom-select-option" data-value="openai_responses">OpenAI Responses API</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-grid-2">
+                        <div class="form-row">
+                            <label>推理强度</label>
+                            <div class="custom-select" id="fReasoningEffortClaude" data-value="">
+                                <div class="custom-select-display">
+                                    <span class="custom-select-text">默认</span>
+                                    <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                </div>
+                                <div class="custom-select-dropdown">
+                                    <div class="custom-select-option" data-value="">默认</div>
+                                    <div class="custom-select-option" data-value="low">Low · 快速</div>
+                                    <div class="custom-select-option" data-value="medium">Medium · 平衡</div>
+                                    <div class="custom-select-option" data-value="high">High · 深度</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <label>上下文长度</label>
+                            <div class="custom-select" id="fContextLengthClaude" data-value="0">
+                                <div class="custom-select-display">
+                                    <span class="custom-select-text">默认</span>
+                                    <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                </div>
+                                <div class="custom-select-dropdown">
+                                    <div class="custom-select-option" data-value="0">默认</div>
+                                    <div class="custom-select-option" data-value="64000">64K</div>
+                                    <div class="custom-select-option" data-value="128000">128K</div>
+                                    <div class="custom-select-option" data-value="256000">256K</div>
+                                    <div class="custom-select-option" data-value="512000">512K</div>
+                                    <div class="custom-select-option" data-value="1000000">1M</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Codex 输入组 -->
+                <div class="app-fields" data-app="codex" style="display:none;">
+                    <div class="app-fields-head"><span class="app-fields-tag">CODEX</span></div>
+                    <div class="form-row">
+                        <label>端点 URL <span class="req">*</span></label>
+                        <input type="text" id="fEndpointCodex" placeholder="https://api.deepseek.com/v1">
+                    </div>
+                    <div class="form-grid-2">
+                        <div class="form-row" style="position:relative;">
+                            <label>默认模型</label>
+                            <div class="model-input-group">
+                                <input type="text" id="fDefaultModelCodex" placeholder="deepseek-v4-flash">
+                                <button type="button" class="btn-fetch-models" data-app="codex" title="从端点获取模型列表">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                        <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                                    </svg>
+                                </button>
+                            </div>
+                            <div class="model-dropdown" id="modelDropdownCodex" style="display:none;"></div>
+                        </div>
+                        <div class="form-row">
+                            <label>API 格式</label>
+                            <div class="custom-select" id="fApiFormatCodex" data-value="openai_responses">
+                                <div class="custom-select-display">
+                                    <span class="custom-select-text">OpenAI Responses API</span>
+                                    <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                </div>
+                                <div class="custom-select-dropdown">
+                                    <div class="custom-select-option" data-value="">自动检测</div>
+                                    <div class="custom-select-option" data-value="anthropic_messages">Anthropic Messages</div>
+                                    <div class="custom-select-option" data-value="openai_chat">OpenAI Chat Completions</div>
+                                    <div class="custom-select-option" data-value="openai_responses">OpenAI Responses API</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-grid-2">
+                        <div class="form-row">
+                            <label>推理强度</label>
+                            <div class="custom-select" id="fReasoningEffortCodex" data-value="">
+                                <div class="custom-select-display">
+                                    <span class="custom-select-text">默认</span>
+                                    <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                </div>
+                                <div class="custom-select-dropdown">
+                                    <div class="custom-select-option" data-value="">默认</div>
+                                    <div class="custom-select-option" data-value="low">Low · 快速</div>
+                                    <div class="custom-select-option" data-value="medium">Medium · 平衡</div>
+                                    <div class="custom-select-option" data-value="high">High · 深度</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <label>上下文长度</label>
+                            <div class="custom-select" id="fContextLengthCodex" data-value="0">
+                                <div class="custom-select-display">
+                                    <span class="custom-select-text">默认</span>
+                                    <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                </div>
+                                <div class="custom-select-dropdown">
+                                    <div class="custom-select-option" data-value="0">默认</div>
+                                    <div class="custom-select-option" data-value="64000">64K</div>
+                                    <div class="custom-select-option" data-value="128000">128K</div>
+                                    <div class="custom-select-option" data-value="256000">256K</div>
+                                    <div class="custom-select-option" data-value="512000">512K</div>
+                                    <div class="custom-select-option" data-value="1000000">1M</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="form-row">
                     <label>API Key</label>
                     <div class="api-key-input-wrap" style="position:relative;">
@@ -348,35 +495,6 @@
                         <button type="button" id="fApiKeyToggle" title="显示/隐藏" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:inherit;opacity:.6;padding:2px;">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                         </button>
-                    </div>
-                </div>
-                <div class="form-grid-2">
-                    <div class="form-row" style="position:relative;">
-                        <label>默认模型</label>
-                        <div class="model-input-group">
-                            <input type="text" id="fDefaultModel" placeholder="claude-haiku-4-5">
-                            <button type="button" class="btn-fetch-models" id="fetchModelsBtn" title="从端点获取模型列表">
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                                    <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-                                </svg>
-                            </button>
-                        </div>
-                        <div class="model-dropdown" id="modelDropdown" style="display:none;"></div>
-                    </div>
-                    <div class="form-row">
-                        <label>API 格式</label>
-                        <div class="custom-select" id="fApiFormat" data-value="">
-                            <div class="custom-select-display">
-                                <span class="custom-select-text">自动检测</span>
-                                <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                            </div>
-                            <div class="custom-select-dropdown">
-                                <div class="custom-select-option" data-value="">自动检测</div>
-                                <div class="custom-select-option" data-value="anthropic_messages">Anthropic Messages</div>
-                                <div class="custom-select-option" data-value="openai_chat">OpenAI Chat Completions</div>
-                                <div class="custom-select-option" data-value="openai_responses">OpenAI Responses API</div>
-                            </div>
-                        </div>
                     </div>
                 </div>
                 <div class="form-row">
@@ -471,6 +589,11 @@
                         <label class="toggle"><input type="checkbox" id="setAutoSyncClaude" checked><span class="toggle-slider"></span></label>
                     </div>
                     <p class="settings-hint">DETECT CC CONFIG · AUTO-ADD IF MISSING</p>
+                    <div class="settings-row">
+                        <label>SYNC CODEX ON BOOT</label>
+                        <label class="toggle"><input type="checkbox" id="setAutoSyncCodex" checked><span class="toggle-slider"></span></label>
+                    </div>
+                    <p class="settings-hint">DETECT CODEX CONFIG · AUTO-ADD IF MISSING</p>
                 </div>
                 <div class="settings-section">
                     <h4><span class="settings-sec-code">03</span> FAILOVER</h4>
@@ -596,6 +719,6 @@
     <!-- ============ Toast ============ -->
     <div class="toast" id="toast"></div>
 
-    <script src="js/app.js?v=20260721-tray-anim"></script>
+    <script src="js/app.js?v=20260731-codex"></script>
 </body>
 </html>

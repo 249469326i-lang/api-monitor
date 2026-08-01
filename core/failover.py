@@ -88,6 +88,7 @@ def confirm_pending(log_callback=None) -> dict:
         candidate=pending["candidate"],
         log_callback=log_callback,
         reason="用户确认切换",
+        app_type=pending.get("app_type"),
     )
 
 
@@ -119,9 +120,18 @@ def check_and_failover(failed_provider_id: int, log_callback=None) -> dict:
     if not failed:
         return {"switched": False, "reason": "供应商不存在"}
 
-    # 仅当前供应商失败才切换
-    if failed.get("role") != "当前":
+    # 仅当前供应商失败才切换（任一绑定为「当前」即视为当前）
+    if not _provider_is_current(failed):
         return {"switched": False, "reason": "非当前供应商，无需切换"}
+
+    # 双端供应商: 取 role=当前 的绑定所在应用；否则主绑定 claude
+    failed_app = failed.get("app_type") or "claude"
+    if failed_app == "both":
+        failed_app = "claude"
+        for b in failed.get("apps") or []:
+            if b.get("role") == "当前":
+                failed_app = b.get("app_type")
+                break
 
     # 冷却检查、计数检查到实际切换必须整段持锁：
     # 并发批测下多个失败回调会同时到达这里
@@ -143,7 +153,10 @@ def check_and_failover(failed_provider_id: int, log_callback=None) -> dict:
                 "reason": f"已达最大连续切换次数({max_switches})",
             }
 
-        candidate = _find_best_candidate(exclude_id=failed_provider_id)
+        candidate = _find_best_candidate(
+            exclude_id=failed_provider_id,
+            app_type=failed_app,
+        )
         if not candidate:
             return {"switched": False, "reason": "没有可用的备用供应商"}
 
@@ -155,6 +168,7 @@ def check_and_failover(failed_provider_id: int, log_callback=None) -> dict:
                 "to": candidate.get("name", ""),
                 "to_id": candidate.get("id"),
                 "candidate": candidate,
+                "app_type": failed_app,
                 "ts": now,
             }
             log("warn", f"⚡ 建议切换到 [{candidate.get('name')}]，等待确认…")
@@ -185,10 +199,11 @@ def check_and_failover(failed_provider_id: int, log_callback=None) -> dict:
             candidate=candidate,
             log_callback=log_callback,
             reason="自动故障切换",
+            app_type=failed_app,
         )
 
 
-def _do_switch(failed_name: str, candidate: dict, log_callback=None, reason: str = "") -> dict:
+def _do_switch(failed_name: str, candidate: dict, log_callback=None, reason: str = "", app_type=None) -> dict:
     global _last_switch_time, _consecutive_switches, _pending_confirm
 
     def log(level, text):
@@ -198,7 +213,7 @@ def _do_switch(failed_name: str, candidate: dict, log_callback=None, reason: str
             except Exception:
                 pass
 
-    result = providers.set_current_provider(candidate["id"])
+    result = providers.set_current_provider(candidate["id"], app_type)
     if result.get("success"):
         latency = candidate.get("latency")
         latency_str = f"{latency}ms" if latency is not None else "?"
@@ -240,14 +255,37 @@ def _do_switch(failed_name: str, candidate: dict, log_callback=None, reason: str
     return {"switched": False, "reason": f"切换失败: {err}"}
 
 
-def _find_best_candidate(exclude_id: int) -> Optional[dict]:
+def _provider_is_current(p: dict) -> bool:
+    """供应商是否当前：任一绑定的 role=当前（兼容旧顶层 role 字段）。"""
+    if p.get("role") == "当前":
+        return True
+    for b in p.get("apps") or []:
+        if b.get("role") == "当前":
+            return True
+    return False
+
+
+def _matches_app(p: dict, app_type: Optional[str]) -> bool:
+    """供应商是否服务于指定应用（按 apps 绑定判断，兼容旧顶层 app_type）。"""
+    if not app_type:
+        return True
+    for b in p.get("apps") or []:
+        if b.get("app_type") == app_type:
+            return True
+    return (p.get("app_type") or "claude") == app_type
+
+
+def _find_best_candidate(exclude_id: int, app_type: Optional[str] = None) -> Optional[dict]:
     """
     查找最优备用供应商
     优先级: 最近测试 OK → 延迟最低 → ID 最小
+    app_type 非空时只考虑同应用类型(Claude/Codex 各自独立切换)。
     """
     candidates = []
     for p in db.get_providers():
         if p.get("id") == exclude_id:
+            continue
+        if not _matches_app(p, app_type):
             continue
         if p.get("status") != "ok":
             continue

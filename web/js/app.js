@@ -23,6 +23,8 @@ class App {
         this._lastClickedIndex = null;
         this._selectionMode = false;
         this.api = window.pywebview?.api || null;
+        this.activeApp = 'claude';   // 当前分页: claude | codex
+        this.currentModes = { claude: { mode: 'official', provider_name: null }, codex: { mode: 'official', provider_name: null } };
 
         this.init();
     }
@@ -118,6 +120,13 @@ class App {
 
     /* ----------------------------- Events ----------------------------- */
     bindEvents() {
+        // 点击空白处关闭启动/同步下拉菜单
+        document.addEventListener('click', (e) => {
+            if (!e.target.closest('.nav-menu') && !e.target.closest('.tb-menu')) {
+                document.querySelectorAll('.menu-dropdown.show').forEach(dd => dd.classList.remove('show'));
+            }
+        });
+
         // Window controls (frameless mode)
         document.getElementById('winMinBtn')?.addEventListener('click', () => {
             if (this.api?.minimize_window) this.api.minimize_window();
@@ -203,10 +212,43 @@ class App {
         // Provider list card actions
         document.getElementById('fastTestBtn')?.addEventListener('click', () => this.testAll('fast'));
         document.getElementById('refreshBtn')?.addEventListener('click', () => this.loadData());
-        document.getElementById('importBtn')?.addEventListener('click', () => this.importFromClaudeCode());
+        document.getElementById('importBtn')?.addEventListener('click', (e) => this.toggleMenu('importDropdown', e));
         document.getElementById('addBtn')?.addEventListener('click', () => this.openAddModal());
-        document.getElementById('launchBtn')?.addEventListener('click', () => this.launchClaude());
+        document.getElementById('launchBtn')?.addEventListener('click', (e) => e?.stopPropagation());
         document.getElementById('selectModeBtn')?.addEventListener('click', () => this.toggleSelectionMode());
+        // 启动/同步 下拉菜单项
+        document.querySelectorAll('#launchDropdown .menu-option').forEach(el => {
+            el.addEventListener('click', () => {
+                const t = el.dataset.target;
+                if (t === 'codex-cli') this.launchCodex();
+                else if (t === 'chatgpt-desktop') this.launchChatGPTDesktop();
+                else this.launchClaude();
+            });
+        });
+        document.querySelectorAll('#importDropdown .menu-option').forEach(el => {
+            el.addEventListener('click', () => {
+                const t = el.dataset.target;
+                if (t === 'codex') this.importFromCodex();
+                else this.importFromClaudeCode();
+            });
+        });
+
+        // 应用分页：Claude Code / Codex
+        document.querySelectorAll('#appTabs .app-tab').forEach(el => {
+            el.addEventListener('click', () => this.switchAppTab(el.dataset.app));
+        });
+        // 每应用模式条：官方 / 第三方
+        document.querySelectorAll('#modeBar .mode-btn').forEach(el => {
+            el.addEventListener('click', () => this.switchMode(el.dataset.mode));
+        });
+        // 新增/编辑表单：应用勾选切换对应输入组
+        ['fAppClaude', 'fAppCodex'].forEach(id => {
+            document.getElementById(id)?.addEventListener('change', () => this._syncAppFields());
+        });
+        // 获取模型（每个应用一个按钮，data-app 定位）
+        document.querySelectorAll('.btn-fetch-models').forEach(btn => {
+            btn.addEventListener('click', () => this.fetchModels(btn.dataset.app));
+        });
 
         // Detail card head actions
         document.getElementById('testOneBtn')?.addEventListener('click', () => this.testSelected());
@@ -252,9 +294,6 @@ class App {
             if (e.target.id === 'aboutModal') this.closeAboutModal();
         });
 
-        // Fetch models button
-        document.getElementById('fetchModelsBtn')?.addEventListener('click', () => this.fetchModels());
-
         // Confirm modal
         document.getElementById('confirmCancelBtn')?.addEventListener('click', () => this._closeConfirm(false));
         document.getElementById('confirmOkBtn')?.addEventListener('click', () => this._closeConfirm(true));
@@ -271,8 +310,13 @@ class App {
             e.preventDefault();
             this.importFromClaudeCode();
         });
+        document.getElementById('emptyImportCodexLink')?.addEventListener('click', (e) => {
+            e.preventDefault();
+            this.importFromCodex();
+        });
         document.getElementById('emptyAddBtn')?.addEventListener('click', () => this.openAddModal());
         document.getElementById('emptyImportBtn')?.addEventListener('click', () => this.importFromClaudeCode());
+        document.getElementById('emptyImportCodexBtn')?.addEventListener('click', () => this.importFromCodex());
         document.getElementById('emptyTestBtn')?.addEventListener('click', () => this.testAll('fast'));
         document.getElementById('bgResetBtn')?.addEventListener('click', () => this.resetSceneBackgrounds());
         document.getElementById('bgPreviewBtn')?.addEventListener('click', () => {
@@ -674,11 +718,11 @@ class App {
             const providers = await backend.get_providers();
 
             this.providers = providers;
-            this.filteredProviders = [...providers];
+            this.applyAppFilter();
             this.renderStats(stats, animate);
             this.renderProviders(this.filteredProviders, animate);
-            this.updateProviderCount(this.filteredProviders.length);
             this.toggleEmptyHint(providers.length === 0);
+            await this._loadCurrentModes();
             this._loadDataFailed = false;
         } catch (error) {
             console.error('Failed to load data:', error);
@@ -871,12 +915,14 @@ class App {
     filterProviders(query) {
         this._searchKeywords = [];
         query = query.trim();
+        // 作用域限当前分页（Claude Code / Codex）
+        const appFiltered = this.providers.filter(p => this._providerForApp(p, this.activeApp));
         if (!query) {
-            this.filteredProviders = [...this.providers];
+            this.filteredProviders = appFiltered;
         } else {
             const keywords = query.toLowerCase().split(/\s+/).filter(Boolean);
             this._searchKeywords = keywords;
-            this.filteredProviders = this.providers.filter(p => {
+            this.filteredProviders = appFiltered.filter(p => {
                 const haystack = [
                     p.name, p.endpoint, p.category, p.notes,
                     p.default_model, p.api_format, this._apiFormatLabel(p.api_format, ''), p.app_type, p.role, p.detail,
@@ -933,6 +979,95 @@ class App {
             `<span class="latency ${latClass}">${this.escape(raw)}</span>` +
             `${this._latencyBars(raw === '--' ? '' : raw)}` +
             `</span>`;
+    }
+
+    /* --------------------- 应用分页 & 官方/第三方模式 -------------------- */
+
+    _providerForApp(p, app) {
+        if (!app) return false;
+        if (Array.isArray(p.apps) && p.apps.length) {
+            return p.apps.some(b => b.app_type === app);
+        }
+        // 兼容旧数据：无 apps 时按顶层 app_type
+        const t = p.app_type || 'claude';
+        return t === app || t === 'both';
+    }
+
+    applyAppFilter() {
+        this.filteredProviders = this.providers.filter(p => this._providerForApp(p, this.activeApp));
+        this.updateProviderCount(this.filteredProviders.length);
+    }
+
+    _loadCurrentModes() {
+        const backend = this.backend();
+        if (!backend.get_current_modes) return Promise.resolve();
+        return backend.get_current_modes().then(r => {
+            if (r && r.success && r.data) {
+                this.currentModes = Object.assign(this.currentModes, r.data);
+            }
+            this.renderModeBar();
+        }).catch(() => this.renderModeBar());
+    }
+
+    renderModeBar() {
+        const app = this.activeApp;
+        const st = this.currentModes[app] || { mode: 'official', provider_name: null };
+        const cur = document.getElementById('modeCur');
+        if (cur) {
+            if (st.mode === 'provider') {
+                cur.textContent = st.provider_name ? `当前: ${st.provider_name}` : '第三方';
+            } else {
+                cur.textContent = '官方账号';
+            }
+        }
+        document.querySelectorAll('#modeBar .mode-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.mode === st.mode);
+        });
+        document.querySelectorAll('#appTabs .app-tab').forEach(t => {
+            t.classList.toggle('active', t.dataset.app === app);
+        });
+    }
+
+    switchAppTab(app) {
+        if (app === this.activeApp) return;
+        this.activeApp = app;
+        // 若当前选中的供应商不属于新分页，清空选中
+        const sel = this.providers.find(p => String(p.id) === String(this.selectedProviderId));
+        if (sel && !this._providerForApp(sel, app)) {
+            this.selectedProviderId = null;
+            this.clearProviderDetail();
+        }
+        this.filterProviders('');
+        this.renderModeBar();
+    }
+
+    async switchMode(mode) {
+        if (mode === 'official') {
+            const app = this.activeApp;
+            try {
+                const r = await this.backend().set_current_official(app);
+                if (r && r.success) {
+                    await this.loadData(false);
+                    this.toast('已切换为官方账号模式', 'success');
+                    this.pushLog('info', `已将 ${app === 'codex' ? 'Codex' : 'Claude Code'} 切换为官方账号模式`);
+                } else {
+                    this.toast((r && r.error) || '切换失败', 'error');
+                }
+            } catch (e) {
+                this.toast('切换失败: ' + e.message, 'error');
+            }
+        } else {
+            // 第三方模式由「设为当前」进入，这里引导用户
+            this.toast('在下方选择一个供应商，点 ★ 设为当前', 'info');
+        }
+    }
+
+    _syncAppFields() {
+        document.querySelectorAll('.app-fields').forEach(g => {
+            const app = g.dataset.app;
+            const cb = document.getElementById(app === 'codex' ? 'fAppCodex' : 'fAppClaude');
+            g.style.display = (cb && cb.checked) ? '' : 'none';
+        });
     }
 
     renderProviders(providers, animate = true) {
@@ -1565,6 +1700,38 @@ class App {
         }
     }
 
+    async importFromCodex() {
+        const ok = await this.showConfirm(
+            '将读取当前 Codex 生效配置（~/.codex/config.toml 与环境变量），并与已有 Codex 供应商对比：\n• 相同配置 → 标为「当前」\n• 不同配置 → 自动新建供应商',
+            '同步 Codex 配置',
+            '开始同步',
+            'primary'
+        );
+        if (!ok) return;
+        try {
+            const backend = this.backend();
+            if (!backend.sync_codex_provider) {
+                this.toast('当前版本后端不支持同步 Codex，请重新安装最新 exe', 'error');
+                return;
+            }
+            const result = await backend.sync_codex_provider();
+            if (result?.success) {
+                await this.loadData(false);
+                const action = result.action || '';
+                const level = (action === 'created' || action === 'updated') ? 'success' : 'info';
+                this.toast(result.message || '同步完成', level);
+                if (result.provider_id != null) {
+                    this.selectProvider(String(result.provider_id));
+                }
+                return;
+            }
+            this.toast(result?.error || result?.message || '同步失败', 'error');
+        } catch (error) {
+            console.error('Sync Codex failed:', error);
+            this.toast('同步失败: ' + (error?.message || error), 'error');
+        }
+    }
+
     async importFromCCSwitch() {
         // 次要路径: 从 cc-switch / 本地 .db 导入
         const ok = await this.showConfirm(
@@ -1607,17 +1774,28 @@ class App {
         document.getElementById('modalTitle').textContent = '新增提供商';
         document.getElementById('modalProviderId').value = '';
         document.getElementById('fName').value = '';
-        this._setCustomSelectValue('fAppType', 'claude');
-        this._setCustomSelectValue('fRole', '备用');
-        this._setCustomSelectValue('fApiFormat', '');
-        document.getElementById('fEndpoint').value = '';
+        // 默认勾选当前分页的应用
+        document.getElementById('fAppClaude').checked = this.activeApp === 'claude';
+        document.getElementById('fAppCodex').checked = this.activeApp === 'codex';
+        this._setCustomSelectValue('fApiFormatClaude', 'anthropic_messages');
+        this._setCustomSelectValue('fApiFormatCodex', 'openai_responses');
+        this._setCustomSelectValue('fReasoningEffortClaude', '');
+        this._setCustomSelectValue('fContextLengthClaude', '0');
+        this._setCustomSelectValue('fReasoningEffortCodex', '');
+        this._setCustomSelectValue('fContextLengthCodex', '0');
+        document.getElementById('fEndpointClaude').value = '';
+        document.getElementById('fEndpointCodex').value = '';
         document.getElementById('fApiKey').value = '';
-        document.getElementById('fDefaultModel').value = '';
+        document.getElementById('fDefaultModelClaude').value = '';
+        document.getElementById('fDefaultModelCodex').value = '';
         document.getElementById('fCategory').value = '';
         document.getElementById('fNotes').value = '';
-        // Reset model dropdown
-        const dd = document.getElementById('modelDropdown');
-        if (dd) { dd.style.display = 'none'; dd.innerHTML = ''; }
+        this._syncAppFields();
+        // Reset model dropdowns
+        ['modelDropdownClaude', 'modelDropdownCodex'].forEach(id => {
+            const dd = document.getElementById(id);
+            if (dd) { dd.style.display = 'none'; dd.innerHTML = ''; }
+        });
         document.getElementById('providerModal').classList.add('show');
         setTimeout(() => document.getElementById('fName').focus(), 50);
     }
@@ -1625,52 +1803,89 @@ class App {
     openEditModal() {
         const p = this.providers.find(p => String(p.id) === String(this.selectedProviderId));
         if (!p) return;
+        const apps = (Array.isArray(p.apps) && p.apps.length) ? p.apps : [];
+        const claudeB = apps.find(b => b.app_type === 'claude');
+        const codexB = apps.find(b => b.app_type === 'codex');
+        const isClaude = !!claudeB || (p.app_type || 'claude') === 'claude' || (p.app_type || '') === 'both';
+        const isCodex = !!codexB || (p.app_type || '') === 'codex' || (p.app_type || '') === 'both';
+
         document.getElementById('modalTitle').textContent = '编辑: ' + (p.name || '');
         document.getElementById('modalProviderId').value = p.id;
         document.getElementById('fName').value = p.name || '';
-        this._setCustomSelectValue('fAppType', p.app_type || 'claude');
-        this._setCustomSelectValue('fRole', p.role || '备用');
-        this._setCustomSelectValue('fApiFormat', p.api_format || '');
-        document.getElementById('fEndpoint').value = p.endpoint || '';
+        document.getElementById('fAppClaude').checked = isClaude;
+        document.getElementById('fAppCodex').checked = isCodex;
+        document.getElementById('fEndpointClaude').value = (claudeB && claudeB.endpoint) || (isClaude ? (p.endpoint || '') : '');
+        document.getElementById('fEndpointCodex').value = (codexB && codexB.endpoint) || (isCodex && !isClaude ? (p.endpoint || '') : '');
+        this._setCustomSelectValue('fApiFormatClaude', (claudeB && claudeB.api_format) || 'anthropic_messages');
+        this._setCustomSelectValue('fApiFormatCodex', (codexB && codexB.api_format) || 'openai_responses');
+        this._setCustomSelectValue('fReasoningEffortClaude', (claudeB && claudeB.reasoning_effort) || '');
+        this._setCustomSelectValue('fContextLengthClaude', String((claudeB && claudeB.context_length) || 0));
+        this._setCustomSelectValue('fReasoningEffortCodex', (codexB && codexB.reasoning_effort) || '');
+        this._setCustomSelectValue('fContextLengthCodex', String((codexB && codexB.context_length) || 0));
+        document.getElementById('fDefaultModelClaude').value = (claudeB && claudeB.default_model) || '';
+        document.getElementById('fDefaultModelCodex').value = (codexB && codexB.default_model) || '';
         document.getElementById('fApiKey').value = ''; // 安全:仅当用户填写则覆盖
         document.getElementById('fApiKey').placeholder = p.key && p.key !== '-' ? `当前: ${p.key}` : 'sk-...';
-        document.getElementById('fDefaultModel').value = p.default_model || '';
         document.getElementById('fCategory').value = p.category || '';
         document.getElementById('fNotes').value = p.notes || '';
-        // Reset model dropdown
-        const dd = document.getElementById('modelDropdown');
-        if (dd) { dd.style.display = 'none'; dd.innerHTML = ''; }
+        this._syncAppFields();
+        // Reset model dropdowns
+        ['modelDropdownClaude', 'modelDropdownCodex'].forEach(id => {
+            const dd = document.getElementById(id);
+            if (dd) { dd.style.display = 'none'; dd.innerHTML = ''; }
+        });
         document.getElementById('providerModal').classList.add('show');
     }
 
     closeProviderModal() {
         document.getElementById('providerModal').classList.remove('show');
-        const dd = document.getElementById('modelDropdown');
-        if (dd) { dd.style.display = 'none'; dd.innerHTML = ''; }
+        ['modelDropdownClaude', 'modelDropdownCodex'].forEach(id => {
+            const dd = document.getElementById(id);
+            if (dd) { dd.style.display = 'none'; dd.innerHTML = ''; }
+        });
     }
 
     async saveProviderFromModal() {
         const id = document.getElementById('modalProviderId').value;
-        const data = {
-            name: document.getElementById('fName').value.trim(),
-            app_type: this._getCustomSelectValue('fAppType'),
-            role: this._getCustomSelectValue('fRole'),
-            endpoint: document.getElementById('fEndpoint').value.trim(),
-            api_key: document.getElementById('fApiKey').value.trim(),
-            default_model: document.getElementById('fDefaultModel').value.trim(),
-            api_format: this._getCustomSelectValue('fApiFormat'),
-            category: document.getElementById('fCategory').value.trim(),
-            notes: document.getElementById('fNotes').value.trim(),
-        };
+        const name = document.getElementById('fName').value.trim();
+        const apiKey = document.getElementById('fApiKey').value.trim();
+        const category = document.getElementById('fCategory').value.trim();
+        const notes = document.getElementById('fNotes').value.trim();
+        if (!name) { this.toast('请填写名称', 'error'); return; }
 
-        if (!data.name) { this.toast('请填写名称', 'error'); return; }
-        if (!data.endpoint) { this.toast('请填写端点 URL', 'error'); return; }
+        // 每应用独立输入组 → apps 绑定数组
+        const readApp = (app) => {
+            const cap = app === 'codex' ? 'Codex' : 'Claude';
+            const binding = {
+                app_type: app,
+                endpoint: document.getElementById('fEndpoint' + cap).value.trim(),
+                default_model: document.getElementById('fDefaultModel' + cap).value.trim(),
+                api_format: this._getCustomSelectValue('fApiFormat' + cap),
+                reasoning_effort: this._getCustomSelectValue('fReasoningEffort' + cap),
+                context_length: parseInt(this._getCustomSelectValue('fContextLength' + cap)) || 0,
+            };
+            return binding;
+        };
+        const apps = [];
+        if (document.getElementById('fAppClaude').checked) {
+            const b = readApp('claude');
+            if (!b.endpoint) { this.toast('请填写 Claude Code 端点 URL', 'error'); return; }
+            apps.push(b);
+        }
+        if (document.getElementById('fAppCodex').checked) {
+            const b = readApp('codex');
+            if (!b.endpoint) { this.toast('请填写 Codex 端点 URL', 'error'); return; }
+            apps.push(b);
+        }
+        if (!apps.length) { this.toast('请至少勾选一个应用', 'error'); return; }
+
+        const data = { name, apps, category, notes };
+        if (apiKey) data.api_key = apiKey;
 
         try {
             const backend = this.backend();
             let result;
             if (id) {
-                if (!data.api_key) delete data.api_key; // 不覆盖原 key
                 result = await backend.update_provider(id, data);
             } else {
                 result = await backend.add_provider(data);
@@ -1678,6 +1893,7 @@ class App {
             if (result?.success) {
                 this.closeProviderModal();
                 this.toast(id ? '已更新' : '已添加', 'success');
+                await this.loadData(false);
             } else {
                 this.toast(result?.error || '保存失败', 'error');
             }
@@ -1687,13 +1903,15 @@ class App {
     }
 
     /* --------------------------- Fetch Models ---------------------------- */
-    async fetchModels() {
-        const endpoint = document.getElementById('fEndpoint')?.value.trim();
+    async fetchModels(app) {
+        const appType = app === 'codex' ? 'codex' : 'claude';
+        const cap = appType === 'codex' ? 'Codex' : 'Claude';
+        const endpoint = document.getElementById('fEndpoint' + cap)?.value.trim();
         const apiKey = document.getElementById('fApiKey')?.value.trim();
-        const inputModel = document.getElementById('fDefaultModel')?.value.trim();
-        const apiFormat = this._getCustomSelectValue('fApiFormat');
-        const dropdown = document.getElementById('modelDropdown');
-        const btn = document.getElementById('fetchModelsBtn');
+        const inputModel = document.getElementById('fDefaultModel' + cap)?.value.trim();
+        const apiFormat = this._getCustomSelectValue('fApiFormat' + cap);
+        const dropdown = document.getElementById('modelDropdown' + cap);
+        const btn = document.querySelector(`.btn-fetch-models[data-app="${appType}"]`);
 
         if (!endpoint) {
             this.toast('请先填写端点 URL', 'error');
@@ -1713,10 +1931,10 @@ class App {
 
             if (r?.from_fallback && r.models && r.models.length > 0) {
                 // 端点不支持 /models 但返回了候选列表
-                this._showModelDropdown(r.models);
+                this._showModelDropdown(r.models, appType);
                 this.toast(`端点未提供列表，已加载候选模型`, 'info');
             } else if (r?.success && r.models && r.models.length > 0) {
-                this._showModelDropdown(r.models);
+                this._showModelDropdown(r.models, appType);
                 this.toast(`获取到 ${r.models.length} 个模型`, 'success');
             } else if (r?.no_models_endpoint) {
                 // 端点不支持模型列表 — 在 dropdown 内友好提示，不弹错误 toast
@@ -1741,8 +1959,9 @@ class App {
         }
     }
 
-    _showModelDropdown(models) {
-        const dropdown = document.getElementById('modelDropdown');
+    _showModelDropdown(models, app) {
+        const cap = app === 'codex' ? 'Codex' : 'Claude';
+        const dropdown = document.getElementById('modelDropdown' + cap);
         if (!dropdown) return;
 
         dropdown.innerHTML = '';
@@ -1753,7 +1972,7 @@ class App {
             item.className = 'model-dropdown-item';
             item.textContent = name;
             item.addEventListener('click', () => {
-                const input = document.getElementById('fDefaultModel');
+                const input = document.getElementById('fDefaultModel' + cap);
                 if (input) input.value = name;
                 dropdown.style.display = 'none';
             });
@@ -1792,17 +2011,15 @@ class App {
     async setCurrentProvider() {
         const p = this.providers.find(p => String(p.id) === String(this.selectedProviderId));
         if (!p) return;
+        const app = this.activeApp;
+        const appLabel = app === 'codex' ? 'Codex' : 'Claude Code';
         try {
-            const r = await this.backend().set_current_provider(p.id);
+            const r = await this.backend().set_current_provider(p.id, app);
             if (r?.success) {
-                // Update all providers' role
-                this.providers.forEach(pr => { pr.role = String(pr.id) === String(p.id) ? '当前' : '备用'; });
-                this.filteredProviders.forEach(pr => { pr.role = String(pr.id) === String(p.id) ? '当前' : '备用'; });
-                // Re-render table rows
-                this.renderProviders(this.filteredProviders);
+                await this.loadData(false);
                 this.selectProvider(p.id);
-                this.toast(`${p.name} 已设为当前配置`, 'success');
-                this.pushLog('info', `已将 ${p.name} 设为 Claude Code 当前配置`);
+                this.toast(`${p.name} 已设为${appLabel}当前配置`, 'success');
+                this.pushLog('info', `已将 ${p.name} 设为 ${appLabel} 当前配置`);
             } else {
                 this.toast(r?.error || '设置失败', 'error');
             }
@@ -2045,6 +2262,37 @@ class App {
         }
     }
 
+    async launchCodex() {
+        try {
+            const r = await this.backend().launch_codex();
+            if (r?.success) this.toast('Codex CLI 已启动', 'success');
+            else this.toast(r?.error || '启动失败', 'error');
+        } catch (error) {
+            console.error('Launch Codex failed:', error);
+            this.toast('启动失败: ' + error.message, 'error');
+        }
+    }
+
+    async launchChatGPTDesktop() {
+        try {
+            const r = await this.backend().launch_chatgpt_desktop();
+            if (r?.success) this.toast('ChatGPT 桌面版已启动', 'success');
+            else this.toast(r?.error || '启动失败', 'error');
+        } catch (error) {
+            console.error('Launch ChatGPT desktop failed:', error);
+            this.toast('启动失败: ' + error.message, 'error');
+        }
+    }
+
+    toggleMenu(id, e) {
+        e?.stopPropagation();
+        document.querySelectorAll('.menu-dropdown').forEach(dd => {
+            if (dd.id !== id) dd.classList.remove('show');
+        });
+        const dd = document.getElementById(id);
+        if (dd) dd.classList.toggle('show');
+    }
+
     /* ========================= Notifications ========================= */
 
     async toggleNotifDropdown() {
@@ -2133,6 +2381,7 @@ class App {
         set('setRetries', s.test_retries || '2');
         setCheck('setSslVerify', s.ssl_verify);
         setCheck('setAutoSyncClaude', s.auto_sync_claude_on_startup);
+        setCheck('setAutoSyncCodex', s.auto_sync_codex_on_startup);
         setCheck('setFailoverEnabled', s.failover_enabled);
         setCheck('setFailoverConfirm', s.failover_need_confirm);
         set('setMaxSwitches', s.failover_max_switches || '3');
@@ -2167,6 +2416,7 @@ class App {
             test_retries: get('setRetries'),
             ssl_verify: getCheck('setSslVerify'),
             auto_sync_claude_on_startup: getCheck('setAutoSyncClaude'),
+            auto_sync_codex_on_startup: getCheck('setAutoSyncCodex'),
             failover_enabled: getCheck('setFailoverEnabled'),
             failover_need_confirm: getCheck('setFailoverConfirm'),
             failover_max_switches: get('setMaxSwitches'),
@@ -2801,14 +3051,19 @@ class MockBackend {
     }
 
     _seed() {
+        const seed = (p) => ({
+            ...p,
+            apps: [{ app_type: p.app_type, endpoint: p.endpoint, default_model: p.default_model || '', api_format: p.api_format || '', role: p.role }],
+        });
         return [
-            { id: 1, name: "Lucky-api",  app_type: "claude", role: "当前", endpoint: "https://openrouter.ai/api/v1",     api_key: "sk-lucky001",    status: "ok",      latency: 128, test_detail: "正常",     default_model: "claude-haiku-4-5", category: "主用", notes: "" },
-            { id: 2, name: "ShareGPT",     app_type: "claude", role: "备用", endpoint: "https://api.siliconflow.cn/v1",    api_key: "sk-share002",    status: "ok",      latency: 89,  test_detail: "正常",     default_model: "", category: "", notes: "" },
-            { id: 3, name: "阿里",          app_type: "claude", role: "备用", endpoint: "https://dashscope.aliyun.com/v1",  api_key: "sk-ali003",      status: "fail",    latency: null, test_detail: "连接超时", default_model: "", category: "", notes: "" },
-            { id: 4, name: "ThatAPI",       app_type: "claude", role: "备用", endpoint: "https://api.thatapi.com/v1",      api_key: "sk-that004",     status: "pending", latency: null, test_detail: "未测试",   default_model: "", category: "", notes: "" },
-            { id: 5, name: "GUPI",          app_type: "claude", role: "备用", endpoint: "https://api.gupi.com/v1",         api_key: "sk-gupi005",     status: "pending", latency: null, test_detail: "未测试",   default_model: "", category: "", notes: "" },
-            { id: 7, name: "DeepSeek",     app_type: "claude", role: "备用", endpoint: "https://api.deepseek.com/v1",     api_key: "sk-ds007",       status: "ok",      latency: 156, test_detail: "正常",     default_model: "", category: "", notes: "" },
-            { id: 8, name: "Moonshot",     app_type: "claude", role: "备用", endpoint: "https://api.moonshot.cn/v1",      api_key: "sk-mk008",       status: "pending", latency: null, test_detail: "未测试",   default_model: "", category: "", notes: "" },
+            seed({ id: 1, name: "Lucky-api",  app_type: "claude", role: "当前", endpoint: "https://openrouter.ai/api/v1",     api_key: "sk-lucky001",    status: "ok",      latency: 128, test_detail: "正常",     default_model: "claude-haiku-4-5", category: "主用", notes: "" }),
+            seed({ id: 2, name: "ShareGPT",     app_type: "claude", role: "备用", endpoint: "https://api.siliconflow.cn/v1",    api_key: "sk-share002",    status: "ok",      latency: 89,  test_detail: "正常",     default_model: "", category: "", notes: "" }),
+            seed({ id: 3, name: "阿里",          app_type: "claude", role: "备用", endpoint: "https://dashscope.aliyun.com/v1",  api_key: "sk-ali003",      status: "fail",    latency: null, test_detail: "连接超时", default_model: "", category: "", notes: "" }),
+            seed({ id: 4, name: "ThatAPI",       app_type: "claude", role: "备用", endpoint: "https://api.thatapi.com/v1",      api_key: "sk-that004",     status: "pending", latency: null, test_detail: "未测试",   default_model: "", category: "", notes: "" }),
+            seed({ id: 5, name: "GUPI",          app_type: "claude", role: "备用", endpoint: "https://api.gupi.com/v1",         api_key: "sk-gupi005",     status: "pending", latency: null, test_detail: "未测试",   default_model: "", category: "", notes: "" }),
+            seed({ id: 7, name: "DeepSeek",     app_type: "claude", role: "备用", endpoint: "https://api.deepseek.com/anthropic", api_key: "sk-ds007",     status: "ok",      latency: 156, test_detail: "正常",     default_model: "deepseek-chat", category: "", notes: "" }),
+            seed({ id: 8, name: "Moonshot",     app_type: "claude", role: "备用", endpoint: "https://api.moonshot.cn/v1",      api_key: "sk-mk008",       status: "pending", latency: null, test_detail: "未测试",   default_model: "", category: "", notes: "" }),
+            seed({ id: 9, name: "DeepSeek-Codex", app_type: "codex", role: "当前", endpoint: "https://api.deepseek.com/v1",   api_key: "sk-ds009",       status: "ok",      latency: 150, test_detail: "正常",     default_model: "deepseek-v4-flash", api_format: "openai_responses", category: "", notes: "" }),
         ];
     }
 
@@ -2837,6 +3092,9 @@ class MockBackend {
             api_format: p.api_format || '',
             category: p.category || '',
             notes: p.notes || '',
+            apps: (Array.isArray(p.apps) && p.apps.length)
+                ? p.apps.map(b => ({ app_type: b.app_type, endpoint: b.endpoint || '', default_model: b.default_model || '', api_format: b.api_format || '', role: b.role || '备用' }))
+                : [],
         }));
     }
 
@@ -2870,21 +3128,31 @@ class MockBackend {
     async add_provider(data) {
         const list = this._load();
         const id = this._nextId(list);
+        // apps → 顶层镜像字段
+        let appType = data.app_type || 'claude';
+        let role = data.role || '备用';
+        let endpoint = data.endpoint || '';
+        let defaultModel = data.default_model || '';
+        let apiFormat = data.api_format || '';
+        let apps = data.apps;
+        if (Array.isArray(apps) && apps.length) {
+            const claude = apps.find(b => b.app_type === 'claude');
+            const codex = apps.find(b => b.app_type === 'codex');
+            appType = (claude && codex) ? 'both' : (codex ? 'codex' : 'claude');
+            const primary = claude || codex || apps[0];
+            endpoint = (primary && primary.endpoint) || endpoint;
+            defaultModel = (primary && primary.default_model) || defaultModel;
+            apiFormat = (primary && primary.api_format) || apiFormat;
+            apps = apps.map(b => ({ app_type: b.app_type, endpoint: b.endpoint || '', default_model: b.default_model || '', api_format: b.api_format || '', role: b.role || '备用' }));
+        } else {
+            apps = [{ app_type: appType, endpoint, default_model: defaultModel, api_format: apiFormat, role }];
+        }
         list.push({
-            id,
-            name: data.name || '',
-            app_type: data.app_type || 'claude',
-            role: data.role || '备用',
-            endpoint: data.endpoint || '',
-            api_key: data.api_key || '',
-            website: data.website || '',
-            category: data.category || '',
-            notes: data.notes || '',
-            default_model: data.default_model || '',
-            api_format: data.api_format || '',
-            status: 'pending',
-            latency: null,
-            test_detail: '未测试',
+            id, name: data.name || '', app_type: appType, role, endpoint,
+            api_key: data.api_key || '', website: data.website || '',
+            category: data.category || '', notes: data.notes || '',
+            default_model: defaultModel, api_format: apiFormat,
+            status: 'pending', latency: null, test_detail: '未测试', apps,
         });
         this._save(list);
         return { success: true, id };
@@ -2896,6 +3164,18 @@ class MockBackend {
         if (!p) return { success: false, error: '未找到' };
         for (const k of ['name','app_type','role','endpoint','api_key','website','category','notes','default_model','api_format']) {
             if (data[k] !== undefined) p[k] = data[k];
+        }
+        if (Array.isArray(data.apps)) {
+            p.apps = data.apps.map(b => ({ app_type: b.app_type, endpoint: b.endpoint || '', default_model: b.default_model || '', api_format: b.api_format || '', role: b.role || '备用' }));
+            const claude = p.apps.find(b => b.app_type === 'claude');
+            const codex = p.apps.find(b => b.app_type === 'codex');
+            p.app_type = (claude && codex) ? 'both' : (codex ? 'codex' : 'claude');
+            const primary = claude || codex;
+            if (primary) {
+                p.endpoint = primary.endpoint;
+                p.default_model = primary.default_model;
+                p.api_format = primary.api_format;
+            }
         }
         this._save(list);
         return { success: true };
@@ -2984,6 +3264,16 @@ class MockBackend {
         };
     }
 
+    async sync_codex_provider() {
+        // 浏览器预览:模拟读取本地 Codex 配置
+        return {
+            success: false,
+            action: 'error',
+            error: '浏览器预览模式无法读取 Codex 配置',
+            message: '浏览器预览模式无法读取 Codex 配置,请运行桌面版 exe',
+        };
+    }
+
     async import_from_ccswitch() {
         // 浏览器预览:没有 cc-switch 数据库,直接返回提示
         return { success: false, error: '浏览器预览模式无法从 cc-switch 导入', imported: 0, missing_db: true };
@@ -2999,11 +3289,60 @@ class MockBackend {
         return { success: false, error: '需要 PyWebView 后端才能启动 Claude Code' };
     }
 
-    async set_current_provider(id) {
+    async launch_codex() {
+        // 浏览器预览中无法启动外部进程
+        return { success: false, error: '需要 PyWebView 后端才能启动 Codex CLI' };
+    }
+
+    async launch_chatgpt_desktop() {
+        // 浏览器预览中无法启动外部进程
+        return { success: false, error: '需要 PyWebView 后端才能启动 ChatGPT 桌面版' };
+    }
+
+    async set_current_provider(id, app_type) {
         const list = this._load();
-        list.forEach(p => { p.role = String(p.id) === String(id) ? '当前' : '备用'; });
+        const target = list.find(p => String(p.id) === String(id));
+        if (!target) return { success: false, error: '供应商不存在' };
+        const app = (app_type === 'codex') ? 'codex' : 'claude';
+        list.forEach(p => {
+            if (Array.isArray(p.apps) && p.apps.length) {
+                p.apps.forEach(b => { if (b.app_type === app) b.role = '备用'; });
+            } else if ((p.app_type || 'claude') === app || (p.app_type || '') === 'both') {
+                p.role = '备用';
+            }
+        });
+        if (Array.isArray(target.apps) && target.apps.length) {
+            target.apps.forEach(b => { if (b.app_type === app) b.role = '当前'; });
+            const primary = target.apps.find(b => b.app_type === 'claude') || target.apps[0];
+            target.role = primary ? primary.role : '当前';
+        } else {
+            target.role = '当前';
+        }
+        this._mockModes = this._mockModes || { claude: { mode: 'official', provider_name: null }, codex: { mode: 'official', provider_name: null } };
+        this._mockModes[app] = { mode: 'provider', provider_name: target.name };
         this._save(list);
         return { success: true, message: '已设为当前配置(预览)' };
+    }
+
+    async set_current_official(app_type) {
+        const app = (app_type === 'codex') ? 'codex' : 'claude';
+        const list = this._load();
+        list.forEach(p => {
+            if (Array.isArray(p.apps) && p.apps.length) {
+                p.apps.forEach(b => { if (b.app_type === app) b.role = '备用'; });
+            } else if ((p.app_type || 'claude') === app || (p.app_type || '') === 'both') {
+                p.role = '备用';
+            }
+        });
+        this._save(list);
+        this._mockModes = this._mockModes || { claude: { mode: 'official', provider_name: null }, codex: { mode: 'official', provider_name: null } };
+        this._mockModes[app] = { mode: 'official', provider_name: null };
+        return { success: true };
+    }
+
+    async get_current_modes() {
+        this._mockModes = this._mockModes || { claude: { mode: 'official', provider_name: null }, codex: { mode: 'official', provider_name: null } };
+        return { success: true, data: this._mockModes };
     }
 
     // Window controls (frameless - no-op in browser)
@@ -3035,6 +3374,7 @@ class MockBackend {
                 notify_status_change: '1', notify_failover: '1', notify_test_complete: '0',
                 webhook_url: '', webhook_events: 'status_change,failover', history_retention_days: '30', ssl_verify: '1',
                 auto_sync_claude_on_startup: '1',
+                auto_sync_codex_on_startup: '1',
             }
         };
     }

@@ -50,6 +50,13 @@ class API:
             except Exception:
                 pass
 
+        # 启动时自动检测 Codex 当前生效配置,未匹配则新增为供应商
+        if db.get_setting("auto_sync_codex_on_startup") == "1":
+            try:
+                providers.auto_detect_codex_provider()
+            except Exception:
+                pass
+
         # 初始化定时测试调度器
         self._scheduler = scheduler.Scheduler(
             test_callback=self._run_scheduled_test,
@@ -896,6 +903,24 @@ class API:
             logger.exception("sync_claude_code_provider failed")
             return {"success": False, "action": "error", "error": str(e), "message": f"同步失败: {e}"}
 
+    def sync_codex_provider(self):
+        """从 Codex 当前配置同步/导入供应商(主导入路径)"""
+        try:
+            result = providers.sync_codex_provider(force=True)
+            if result.get("success"):
+                logger.info(
+                    "Sync Codex provider: action=%s provider_id=%s",
+                    result.get("action"),
+                    result.get("provider_id"),
+                )
+                self._refresh_frontend()
+            else:
+                logger.warning("Sync Codex provider failed: %s", result.get("error") or result.get("reason"))
+            return result
+        except Exception as e:
+            logger.exception("sync_codex_provider failed")
+            return {"success": False, "action": "error", "error": str(e), "message": f"同步失败: {e}"}
+
     def import_from_ccswitch(self):
         """Import from cc-switch (secondary / advanced path)"""
         result = providers.import_from_ccswitch()
@@ -935,16 +960,42 @@ class API:
         """Launch Claude Code"""
         return providers.launch_claude_code()
 
-    def set_current_provider(self, provider_id):
-        """Set a provider as the current Claude Code config"""
+    def launch_codex(self):
+        """Launch Codex CLI"""
+        return providers.launch_codex()
+
+    def launch_chatgpt_desktop(self):
+        """Launch ChatGPT desktop app (OpenAI.Codex Store app)"""
+        return providers.launch_chatgpt_desktop()
+
+    def set_current_provider(self, provider_id, app_type=None):
+        """把供应商设为指定应用（'claude'|'codex'）的当前配置"""
         try:
             pid = int(provider_id)
-            result = providers.set_current_provider(pid)
+            result = providers.set_current_provider(pid, app_type)
             if result.get("success"):
                 failover.reset_counter()
-                logger.info(f"Current provider set: id={pid}")
+                logger.info(f"Current provider set: id={pid}, app={app_type}")
                 self._refresh_frontend()
             return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def set_current_official(self, app_type):
+        """把指定应用设为官方模式（清除第三方覆盖，走官方登录账号）"""
+        try:
+            result = providers.set_current_official(app_type)
+            if result.get("success"):
+                logger.info(f"Current mode set to official: app={app_type}")
+                self._refresh_frontend()
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_current_modes(self):
+        """返回每应用的当前模式（official / provider + 当前供应商名）"""
+        try:
+            return {"success": True, "data": providers.get_current_modes()}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
