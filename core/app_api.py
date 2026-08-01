@@ -1296,9 +1296,6 @@ del "%~f0" >nul 2>&1
             # 关键2：用 CREATE_NEW_PROCESS_GROUP + DETACHED_PROCESS 真正脱离父进程
             clean_env = {k: v for k, v in os.environ.items()
                          if not k.upper().startswith("_MEI")}
-            # 双保险：显式设为空
-            clean_env["_MEIPASS"] = ""
-            clean_env["_MEIPASS2"] = ""
             subprocess.Popen(
                 ["cmd", "/c", bat_path],
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008 | 0x08000000,  # DETACHED_PROCESS | CREATE_NO_WINDOW
