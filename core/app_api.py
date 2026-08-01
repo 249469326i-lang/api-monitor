@@ -1241,17 +1241,40 @@ class API:
             import tempfile
             bat_path = os.path.join(tempfile.gettempdir(), "apimonitor_updater.bat")
 
+            current_exe_name = os.path.basename(current_exe)
             bat_content = f"""@echo off
 chcp 65001 >nul 2>&1
 echo 正在等待程序退出...
-timeout /t 3 /nobreak >nul
 
+REM 循环等待进程退出（最多 15 秒）
+set /a wait_count=0
+:wait_loop
+tasklist /fi "imagename eq {current_exe_name}" 2>nul | find /i "{current_exe_name}" >nul
+if %errorlevel% equ 0 (
+    set /a wait_count+=1
+    if %wait_count% geq 30 (
+        echo 程序未退出，强制结束...
+        taskkill /f /im "{current_exe_name}" >nul 2>&1
+        timeout /t 2 /nobreak >nul
+        goto try_copy
+    )
+    timeout /t 1 /nobreak >nul
+    goto wait_loop
+)
+
+:try_copy
 echo 正在安装更新...
 copy /Y "{temp_exe_path}" "{current_exe}" >nul 2>&1
 if errorlevel 1 (
-    echo 替换文件失败，请手动替换
-    timeout /t 5 /nobreak >nul
-    exit /b 1
+    echo 替换文件失败，尝试重命名旧文件...
+    rename "{current_exe}" "API-Monitor.old.exe" >nul 2>&1
+    copy /Y "{temp_exe_path}" "{current_exe}" >nul 2>&1
+    if errorlevel 1 (
+        echo 替换文件失败，请手动替换
+        timeout /t 5 /nobreak >nul
+        exit /b 1
+    )
+    del "{current_exe}.old.exe" >nul 2>&1
 )
 
 echo 更新完成，正在重启...
