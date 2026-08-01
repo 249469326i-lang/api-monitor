@@ -1244,6 +1244,8 @@ class API:
             current_exe_name = os.path.basename(current_exe)
             bat_content = f"""@echo off
 chcp 65001 >nul 2>&1
+set _MEIPASS=
+set _MEIPASS2=
 echo 正在等待程序退出...
 
 REM 循环等待进程退出（最多 15 秒）
@@ -1289,12 +1291,17 @@ del "%~f0" >nul 2>&1
 
             logger.info(f"Launching updater batch: {bat_path}")
 
-            # 启动批处理（用 start 命令脱离父进程，避免应用退出时被终止）
-            # 关键：清除 _MEIPASS 环境变量，否则新 exe 会找旧临时目录的 python311.dll
-            clean_env = {k: v for k, v in os.environ.items() if not k.startswith("_MEI")}
+            # 启动批处理（脱离父进程，避免应用退出时被终止）
+            # 关键1：清除 _MEIPASS/_MEIPASS2 环境变量，否则新 exe 会找旧临时目录的 python311.dll
+            # 关键2：用 CREATE_NEW_PROCESS_GROUP + DETACHED_PROCESS 真正脱离父进程
+            clean_env = {k: v for k, v in os.environ.items()
+                         if not k.upper().startswith("_MEI")}
+            # 双保险：显式设为空
+            clean_env["_MEIPASS"] = ""
+            clean_env["_MEIPASS2"] = ""
             subprocess.Popen(
-                ["cmd", "/c", "start", "/b", "", bat_path],
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000,  # CREATE_NO_WINDOW
+                ["cmd", "/c", bat_path],
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008 | 0x08000000,  # DETACHED_PROCESS | CREATE_NO_WINDOW
                 close_fds=True,
                 shell=False,
                 env=clean_env,
