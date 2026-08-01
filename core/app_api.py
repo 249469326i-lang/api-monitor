@@ -1278,6 +1278,8 @@ if errorlevel 1 (
 )
 
 echo 更新完成，正在重启...
+set _MEIPASS=
+set _MEIPASS2=
 start "" "{current_exe}"
 
 del "{temp_exe_path}" >nul 2>&1
