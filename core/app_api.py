@@ -1247,28 +1247,15 @@ chcp 65001 >nul 2>&1
 set _MEIPASS=
 set _MEIPASS2=
 
-REM 循环等待进程退出（最多 10 秒）
-set /a wait_count=0
-:wait_loop
-tasklist /fi "imagename eq {current_exe_name}" 2>nul | find /i "{current_exe_name}" >nul
-if %errorlevel% equ 0 (
-    set /a wait_count+=1
-    if %wait_count% geq 20 (
-        taskkill /f /im "{current_exe_name}" >nul 2>&1
-        ping 127.0.0.1 -n 2 >nul 2>&1
-        goto try_copy
-    )
-    ping 127.0.0.1 -n 2 >nul 2>&1
-    goto wait_loop
-)
+REM 直接结束进程，等待 2 秒让文件锁释放
+taskkill /f /im "{current_exe_name}" >nul 2>&1
+ping 127.0.0.1 -n 3 >nul 2>&1
 
-:try_copy
 copy /Y "{temp_exe_path}" "{current_exe}" >nul 2>&1
 if errorlevel 1 (
     rename "{current_exe}" "API-Monitor.old.exe" >nul 2>&1
     copy /Y "{temp_exe_path}" "{current_exe}" >nul 2>&1
     if errorlevel 1 (
-        ping 127.0.0.1 -n 3 >nul 2>&1
         exit /b 1
     )
     del "{current_exe}.old.exe" >nul 2>&1
