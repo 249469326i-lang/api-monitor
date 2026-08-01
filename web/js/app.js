@@ -729,7 +729,7 @@ class App {
             const l = filtered[i];
             const cls = l.level === 'ok' ? 'ok' : l.level === 'err' ? 'err' : 'info';
             const tag = l.name ? `[${this.escape(l.name)}] ` : '';
-            const time = this.escape(l.time);
+            const time = this.escape(String(l.time || '').replace(/\s+/g, ' ').trim());
             const text = this.escape(l.text);
 
             if (l.level === 'ok' || l.level === 'err') {
