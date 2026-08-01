@@ -3,7 +3,7 @@
 
   # API Monitor
 
-  **Windows 桌面端 API 供应商监控工具 —— 定时测速 · 故障切换 · 托盘常驻 · 密钥加密**
+  **Windows 桌面端 API 供应商监控工具 —— Claude Code + Codex 双应用 · 定时测速 · 故障切换 · 推理强度/上下文长度控制 · 托盘常驻 · 密钥加密**
 
   [![CI](https://img.shields.io/github/actions/workflow/status/249469326i-lang/api-monitor/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/249469326i-lang/api-monitor/actions/workflows/ci.yml)
   [![Release](https://img.shields.io/github/v/release/249469326i-lang/api-monitor?style=flat-square)](https://github.com/249469326i-lang/api-monitor/releases)
@@ -40,14 +40,18 @@
 
 | | 功能 | 说明 |
 | --- | --- | --- |
+| 🖥️ | **双应用架构** | 同时管理 **Claude Code** 与 **Codex** 两套 AI 编程工具的 API 供应商，各自独立端点/模型/格式/角色 |
 | 📡 | **多供应商监控** | 同时监控多个 API 供应商 / 模型的延迟与可用性，支持 Anthropic / OpenAI / Gemini 等多种 API 格式自动探测 |
+| 🧠 | **推理强度控制** | 为每个供应商设置 reasoning_effort（Low / Medium / High），写入 Claude Code 环境变量与 Codex config.toml |
+| 📏 | **上下文长度设置** | 为每个供应商设置上下文窗口（64K / 128K / 256K / 512K / 1M），匹配 DeepSeek V4 Flash 等大窗口模型 |
 | ⏱️ | **定时探测** | 自定义探测间隔，失败自动重试；死端点智能短路，不拖慢整轮测试 |
-| 🔀 | **故障转移** | 主线路异常时自动切换到备用供应商（可配置冷却时间、最大切换次数、切换前确认） |
+| 🔀 | **故障转移** | 主线路异常时自动切换到备用供应商，Claude Code / Codex 各自独立切换（可配置冷却时间、最大切换次数） |
+| 🔄 | **配置同步** | 一键从 Claude Code settings.json / Codex config.toml 导入当前配置；启动菜单直达 Claude Code / Codex CLI / ChatGPT 桌面版 |
 | 📈 | **历史趋势** | 延迟历史、P95、可用率统计与趋势图表 |
 | 🖥️ | **托盘常驻** | 最小化到系统托盘，支持开机自启 |
 | 🔐 | **密钥加密** | API Key 使用 Windows DPAPI 本地加密存储，绝不明文落盘，前端仅展示掩码 |
 | 💾 | **备份恢复** | SQLite 在线备份 API 保证一致性，支持自动定期备份 |
-| 📦 | **单文件分发** | 打包为独立 `API-Monitor.exe`，下载即用，无需安装 Python |
+| 📦 | **单文件分发** | 打包为独立 API-Monitor.exe，下载即用，无需安装 Python |
 | 🎨 | **像素风 UI** | 内置像素风格 Web 前端（PyWebView 渲染），字体本地化、离线可用 |
 
 ## 📥 下载与安装
@@ -75,10 +79,12 @@
 
 ## 🚀 快速上手
 
-1. 启动后点击「添加供应商」，填入 API 地址与 Key
-2. 选择需要监控的模型，设置探测间隔
-3. 主面板实时显示各线路延迟与状态，异常时自动故障切换
-4. 关闭窗口自动最小化到托盘，右键托盘图标可退出
+1. 启动后点击「+ 新增」添加供应商，填入 API 地址与 Key
+2. 选择应用类型（Claude Code / Codex），分别配置端点、模型、API 格式
+3. 按需设置推理强度（Low/Medium/High）和上下文长度（64K–1M）
+4. 通过顶部「启动服务」菜单直接启动 Claude Code / Codex CLI / ChatGPT 桌面版
+5. 主面板实时显示各线路延迟与状态，异常时自动故障切换
+6. 关闭窗口自动最小化到托盘，右键托盘图标可退出
 
 ## 🛠️ 源码运行
 
@@ -173,6 +179,9 @@ python verify_backend.py
 - [x] 全面安全加固（密钥零明文下发、XSS/注入防护、WAL 一致性备份）
 - [x] CI 自动化测试（GitHub Actions）
 - [x] 模块化架构重构（分层 core/）
+- [x] Claude Code + Codex 双应用架构（独立端点/模型/格式/角色）
+- [x] 推理强度与上下文长度控制（reasoning_effort / context_length）
+- [x] 故障切换按应用独立（Claude/Codex 各自切换）
 - [ ] 探测历史图表与数据导出增强
 - [ ] 更多供应商预设模板
 - [ ] 多语言界面（欢迎 PR）
