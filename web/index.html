@@ -13,7 +13,7 @@
         @font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 600; font-display: swap; src: url('assets/fonts/ibm-plex-mono-600.woff2') format('woff2'); }
         @font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 700; font-display: swap; src: url('assets/fonts/ibm-plex-mono-700.woff2') format('woff2'); }
     </style>
-    <link rel="stylesheet" href="css/style.css?v=20260801-reasoning-ctx-v2">
+    <link rel="stylesheet" href="css/style.css?v=20260801-autoupdate">
 </head>
 <body>
     <div class="app">
@@ -385,11 +385,11 @@
                             <label>推理强度</label>
                             <div class="custom-select" id="fReasoningEffortClaude" data-value="">
                                 <div class="custom-select-display">
-                                    <span class="custom-select-text">默认</span>
+                                    <span class="custom-select-text">跟随应用默认</span>
                                     <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
                                 </div>
                                 <div class="custom-select-dropdown">
-                                    <div class="custom-select-option" data-value="">默认</div>
+                                    <div class="custom-select-option" data-value="">跟随应用默认（不写入）</div>
                                     <div class="custom-select-option" data-value="low">Low · 快速</div>
                                     <div class="custom-select-option" data-value="medium">Medium · 平衡</div>
                                     <div class="custom-select-option" data-value="high">High · 深度</div>
@@ -400,11 +400,11 @@
                             <label>上下文长度</label>
                             <div class="custom-select" id="fContextLengthClaude" data-value="0">
                                 <div class="custom-select-display">
-                                    <span class="custom-select-text">默认</span>
+                                    <span class="custom-select-text">跟随模型默认</span>
                                     <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
                                 </div>
                                 <div class="custom-select-dropdown">
-                                    <div class="custom-select-option" data-value="0">默认</div>
+                                    <div class="custom-select-option" data-value="0">跟随模型默认（不写入）</div>
                                     <div class="custom-select-option" data-value="64000">64K</div>
                                     <div class="custom-select-option" data-value="128000">128K</div>
                                     <div class="custom-select-option" data-value="256000">256K</div>
@@ -457,11 +457,11 @@
                             <label>推理强度</label>
                             <div class="custom-select" id="fReasoningEffortCodex" data-value="">
                                 <div class="custom-select-display">
-                                    <span class="custom-select-text">默认</span>
+                                    <span class="custom-select-text">跟随应用默认</span>
                                     <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
                                 </div>
                                 <div class="custom-select-dropdown">
-                                    <div class="custom-select-option" data-value="">默认</div>
+                                    <div class="custom-select-option" data-value="">跟随应用默认（不写入）</div>
                                     <div class="custom-select-option" data-value="low">Low · 快速</div>
                                     <div class="custom-select-option" data-value="medium">Medium · 平衡</div>
                                     <div class="custom-select-option" data-value="high">High · 深度</div>
@@ -472,11 +472,11 @@
                             <label>上下文长度</label>
                             <div class="custom-select" id="fContextLengthCodex" data-value="0">
                                 <div class="custom-select-display">
-                                    <span class="custom-select-text">默认</span>
+                                    <span class="custom-select-text">跟随模型默认</span>
                                     <svg class="custom-select-arrow" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
                                 </div>
                                 <div class="custom-select-dropdown">
-                                    <div class="custom-select-option" data-value="0">默认</div>
+                                    <div class="custom-select-option" data-value="0">跟随模型默认（不写入）</div>
                                     <div class="custom-select-option" data-value="64000">64K</div>
                                     <div class="custom-select-option" data-value="128000">128K</div>
                                     <div class="custom-select-option" data-value="256000">256K</div>

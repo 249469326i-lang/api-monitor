@@ -18,6 +18,8 @@ class App {
         this.selectedProviderId = null;
         this.activeDetailTab = 'test';
         this.isTesting = false;
+        this.testingIds = new Set();  // per-provider test state
+        this._updateData = null;
         this.cliLogs = [];          // [{time, name, level, text}]
         this.selectedIds = new Set();
         this._lastClickedIndex = null;
@@ -675,9 +677,35 @@ class App {
     renderCliTab() {
         const detailInfo = document.getElementById('detailInfo');
         if (!detailInfo) return;
+
+        // ── Build model info card from current provider's apps ──
+        let modelInfoHtml = '';
+        const provider = this.providers.find(p => String(p.id) === String(this.selectedProviderId));
+        if (provider && provider.apps && provider.apps.length) {
+            const rows = provider.apps.map(b => {
+                const appLabel = b.app_type === 'codex' ? 'Codex' : 'Claude Code';
+                const model = b.default_model || '未设置';
+                const effort = b.reasoning_effort ? ({low:'Low · 快速', medium:'Medium · 平衡', high:'High · 深度'}[b.reasoning_effort] || b.reasoning_effort) : '跟随应用默认';
+                const ctx = b.context_length > 0 ? (b.context_length >= 1000000 ? '1M' : (b.context_length / 1000) + 'K') : '跟随模型默认';
+                const fmt = b.api_format || '自动检测';
+                const role = b.role || '备用';
+                const roleColor = role === '当前' ? 'var(--px-green)' : 'var(--muted)';
+                return `<div class="cli-model-row">
+                    <span class="cli-model-app">${appLabel}</span>
+                    <span class="cli-model-cell"><span class="cli-model-k">模型</span><span class="cli-model-v">${this.escape(model)}</span></span>
+                    <span class="cli-model-cell"><span class="cli-model-k">推理</span><span class="cli-model-v">${effort}</span></span>
+                    <span class="cli-model-cell"><span class="cli-model-k">上下文</span><span class="cli-model-v">${ctx}</span></span>
+                    <span class="cli-model-cell"><span class="cli-model-k">角色</span><span class="cli-model-v" style="color:${roleColor}">${role}</span></span>
+                </div>`;
+            }).join('');
+            modelInfoHtml = `<div class="cli-model-info"><div class="cli-model-info-title">ℹ️ 当前模型配置</div>${rows}</div>`;
+        }
+
+        // ── Build log area ──
         const filtered = this.selectedProviderId
             ? this.cliLogs.filter(l => !l.name || l.name === this._selectedName())
             : this.cliLogs;
+
         if (!filtered.length) {
             detailInfo.innerHTML = `
                 <div class="cli-empty">
@@ -686,17 +714,49 @@ class App {
                             <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
                         </svg>
                     </div>
-                    <div class="cli-empty-title">暂无 CLI 日志</div>
-                    <div class="cli-empty-desc">执行快速测试或完整测试后，请求/响应日志会显示在这里</div>
+                    <div class="cli-empty-title">暂无测试日志</div>
+                    <div class="cli-empty-desc">点击上方测试按钮，测试结果会显示在这里</div>
                 </div>
-            `;
+            ` + modelInfoHtml;
             return;
         }
-        const html = `<div class="cli-log">${filtered.map(l => {
+
+        // Build structured log: result cards + info lines
+        let parts = [];
+        let lastResultIdx = -1;
+
+        for (let i = 0; i < filtered.length; i++) {
+            const l = filtered[i];
             const cls = l.level === 'ok' ? 'ok' : l.level === 'err' ? 'err' : 'info';
             const tag = l.name ? `[${this.escape(l.name)}] ` : '';
-            return `<span class="log-line ${cls}">${this.escape(l.time)} ${tag}${this.escape(l.text)}</span>`;
-        }).join('')}</div>`;
+            const time = this.escape(l.time);
+            const text = this.escape(l.text);
+
+            if (l.level === 'ok' || l.level === 'err') {
+                const icon = l.level === 'ok' ? '✓' : '✗';
+                const label = l.level === 'ok' ? 'OK' : 'FAIL';
+                parts.push(`<div class="cli-result cli-result-${cls}">
+                    <span class="cli-result-icon">${icon}</span>
+                    <span class="cli-result-label">${label}</span>
+                    <span class="cli-result-body">${tag}${text}</span>
+                    <span class="cli-result-time">${time}</span>
+                </div>`);
+                lastResultIdx = parts.length - 1;
+            } else {
+                parts.push(`<div class="cli-info-line">${time} <span class="cli-info-arrow">&gt;</span> ${tag}${text}</div>`);
+            }
+        }
+
+        // Move the last result to the top
+        if (lastResultIdx > 0) {
+            const last = parts.splice(lastResultIdx, 1)[0];
+            parts.unshift(last);
+        }
+
+        // If we have result cards, filter out the info lines (grey debug text)
+        const hasResults = parts.some(p => p.includes('cli-result'));
+        const displayParts = hasResults ? parts.filter(p => !p.includes('cli-info-line')) : parts;
+        const html = `<div class="cli-log">${displayParts.join('')}</div>${modelInfoHtml}`;
         detailInfo.innerHTML = html;
 
         // Stop pywebview easy-drag so CLI text can be selected/copied.
@@ -736,51 +796,141 @@ class App {
 
     /* ========================= Auto Update ========================= */
 
+
     async _checkForUpdate() {
         try {
             const r = await this.backend().check_update();
             if (r?.success && r.data?.has_update) {
-                this._showUpdateBanner(r.data);
+                this._showUpdateModal(r.data);
             }
         } catch {}
     }
 
-    _showUpdateBanner(data) {
-        // 避免重复显示
-        if (document.getElementById('updateBanner')) return;
-        const banner = document.createElement('div');
-        banner.id = 'updateBanner';
-        banner.className = 'update-banner';
-        banner.innerHTML = `
-            <div class="update-banner-content">
-                <span class="update-icon">↓</span>
-                <div class="update-info">
-                    <span class="update-text">新版本 v${this.escape(data.latest_version)} 可用</span>
-                    <span class="update-changelog" title="${this.escape(data.changelog || '')}">${this.escape((data.changelog || '').split('\n')[0] || '查看更新内容')}</span>
+    _showUpdateModal(data) {
+        if (document.getElementById('updateModal')) return;
+        this._updateData = data;
+        const changelogHtml = (data.changelog || '').split('\n').map(l => this.escape(l)).join('<br>');
+
+        const overlay = document.createElement('div');
+        overlay.id = 'updateModal';
+        overlay.className = 'update-modal-overlay';
+        overlay.innerHTML = `
+            <div class="update-modal">
+                <div class="update-modal-header">
+                    <span class="update-modal-icon">↓</span>
+                    <span class="update-modal-title">发现新版本</span>
                 </div>
-                <div class="update-actions">
-                    <button class="btn btn-sm btn-primary" id="updateDownloadBtn">下载</button>
-                    <button class="btn btn-sm" id="updateDismissBtn">忽略</button>
+                <div class="update-modal-body" id="updateModalBody">
+                    <div class="update-version-row">
+                        <span class="update-version-current">当前版本</span>
+                        <span class="update-version-arrow">→</span>
+                        <span class="update-version-new">v${this.escape(data.latest_version)}</span>
+                    </div>
+                    <div class="update-changelog-box">${changelogHtml || '<span class="update-changelog-empty">暂无更新说明</span>'}</div>
+                    <div class="update-modal-actions" id="updateModalActions">
+                        <button class="btn btn-primary" id="updateStartBtn">立即更新</button>
+                        <button class="btn" id="updateLaterBtn">稍后</button>
+                    </div>
                 </div>
             </div>
         `;
-        // Insert before metric-card in content area (replaces old .main target)
-        const content = document.querySelector('.content');
-        if (content) content.insertBefore(banner, content.firstChild);
+        document.body.appendChild(overlay);
 
-        document.getElementById('updateDownloadBtn')?.addEventListener('click', () => {
-            // 只打开 GitHub 域名的下载链接，防止更新元数据被篡改后跳转任意 URL
-            try {
-                const u = new URL(data.download_url);
-                if (u.protocol === 'https:' && (u.hostname === 'github.com' || u.hostname.endsWith('.github.com') || u.hostname === 'objects.githubusercontent.com')) {
-                    window.open(data.download_url, '_blank');
-                } else {
-                    this.toast('下载链接域名异常，已阻止打开', 'error');
-                }
-            } catch { /* 无效 URL 直接忽略 */ }
+        document.getElementById('updateStartBtn')?.addEventListener('click', () => {
+            this._startUpdateDownload(data.download_url);
         });
-        document.getElementById('updateDismissBtn')?.addEventListener('click', () => {
-            banner.remove();
+        document.getElementById('updateLaterBtn')?.addEventListener('click', () => {
+            overlay.remove();
+        });
+    }
+
+    _startUpdateDownload(downloadUrl) {
+        const body = document.getElementById('updateModalBody');
+        if (!body) return;
+        body.innerHTML = `
+            <div class="update-downloading">
+                <div class="update-progress-label" id="updateProgressLabel">正在下载... 0%</div>
+                <div class="update-progress-bar">
+                    <div class="update-progress-fill" id="updateProgressFill" style="width:0%"></div>
+                </div>
+                <div class="update-progress-size" id="updateProgressSize">0 MB / 0 MB</div>
+                <button class="btn" id="updateCancelBtn">取消</button>
+            </div>
+        `;
+        document.getElementById('updateCancelBtn')?.addEventListener('click', () => {
+            this._cancelUpdateDownload();
+        });
+        this.backend().download_update(downloadUrl);
+    }
+
+    updateDownloadProgress(percent, downloadedMb, totalMb) {
+        const fill = document.getElementById('updateProgressFill');
+        const label = document.getElementById('updateProgressLabel');
+        const size = document.getElementById('updateProgressSize');
+        if (fill) fill.style.width = Math.max(0, percent) + '%';
+        if (label) label.textContent = `正在下载... ${Math.max(0, percent)}%`;
+        if (size) size.textContent = `${downloadedMb} MB / ${totalMb} MB`;
+    }
+
+    updateDownloadComplete(tempPath) {
+        const body = document.getElementById('updateModalBody');
+        if (body) {
+            body.innerHTML = `
+                <div class="update-installing">
+                    <div class="update-spinner"></div>
+                    <div class="update-installing-text">下载完成，正在安装...</div>
+                    <div class="update-installing-hint">程序将自动重启，请勿关闭</div>
+                </div>
+            `;
+        }
+        // 短暂延迟让 UI 渲染
+        setTimeout(() => {
+            this.backend().install_update(tempPath);
+        }, 800);
+    }
+
+    updateDownloadError(errorMsg) {
+        const body = document.getElementById('updateModalBody');
+        if (!body) return;
+        body.innerHTML = `
+            <div class="update-error">
+                <div class="update-error-icon">✗</div>
+                <div class="update-error-text">${this.escape(errorMsg || '下载失败')}</div>
+                <div class="update-modal-actions">
+                    <button class="btn btn-primary" id="updateRetryBtn">重试</button>
+                    <button class="btn" id="updateCloseBtn">关闭</button>
+                </div>
+            </div>
+        `;
+        document.getElementById('updateRetryBtn')?.addEventListener('click', () => {
+            if (this._updateData) this._startUpdateDownload(this._updateData.download_url);
+        });
+        document.getElementById('updateCloseBtn')?.addEventListener('click', () => {
+            const m = document.getElementById('updateModal');
+            if (m) m.remove();
+        });
+    }
+
+    _cancelUpdateDownload() {
+        this.backend().cancel_update_download();
+        const body = document.getElementById('updateModalBody');
+        if (!body) return;
+        body.innerHTML = `
+            <div class="update-error">
+                <div class="update-error-icon">⊘</div>
+                <div class="update-error-text">下载已取消</div>
+                <div class="update-modal-actions">
+                    <button class="btn btn-primary" id="updateRetryBtn">重新下载</button>
+                    <button class="btn" id="updateCloseBtn">关闭</button>
+                </div>
+            </div>
+        `;
+        document.getElementById('updateRetryBtn')?.addEventListener('click', () => {
+            if (this._updateData) this._startUpdateDownload(this._updateData.download_url);
+        });
+        document.getElementById('updateCloseBtn')?.addEventListener('click', () => {
+            const m = document.getElementById('updateModal');
+            if (m) m.remove();
         });
     }
 
@@ -1244,6 +1394,7 @@ class App {
         const provider = this.providers.find(p => String(p.id) === String(id));
         if (provider) {
             this.renderProviderDetail(provider);
+            this._updateTestBtnState(id);
         } else {
             this.clearProviderDetail();
         }
@@ -1292,7 +1443,7 @@ class App {
         if (!detailInfo) return;
 
         if (emptyState) emptyState.style.display = 'none';
-        detailInfo.style.display = 'block';
+        detailInfo.style.display = 'flex';
 
         // Update provider header (only visible after a real selection)
         const header = document.getElementById('dcProviderHeader');
@@ -2148,9 +2299,9 @@ class App {
             try {
                 const r = await this.backend().test_provider(id);
                 if (r?.success) {
-                    this.pushLog('ok', `OK · ${r.latency}ms · ${r.detail || ''}`, pName);
+
                 } else {
-                    this.pushLog('err', `失败 · ${r?.detail || '未知错误'}`, pName);
+
                 }
             } catch (e) {
                 this.pushLog('err', `异常: ${e.message}`, pName);
@@ -2199,21 +2350,43 @@ class App {
     async testSelected() {
         const p = this.providers.find(p => String(p.id) === String(this.selectedProviderId));
         if (!p) return;
-        this.pushLog('info', `开始完整测试 · 发送 你是谁呀，小朋友 验证 AI 回复...`, p.name);
+        // --- per-provider test state ---
+        if (this.testingIds.has(p.id)) return;  // already testing this one
+        this.testingIds.add(p.id);
+        this._updateTestBtnState(p.id);
         try {
             const r = await this.backend().test_provider(p.id);
             if (r?.success) {
-                this.pushLog('ok', `OK · 延迟 ${r.latency}ms · ${r.detail || ''}`, p.name);
                 this.toast(`${p.name} 正常`, 'success');
             } else {
-                this.pushLog('err', `失败 · ${r?.detail || r?.error || '未知错误'}`, p.name);
                 this.toast(`${p.name} 失败`, 'error');
             }
             await this.loadData(false);
-            this.selectProvider(p.id);
+            // Only re-select if user hasn't switched away
+            if (this.selectedProviderId == p.id) this.selectProvider(p.id);
         } catch (e) {
             this.pushLog('err', `异常 · ${e.message}`, p.name);
             this.toast('测试异常', 'error');
+        } finally {
+            this.testingIds.delete(p.id);
+            this._updateTestBtnState(p.id);
+        }
+    }
+
+    _updateTestBtnState(providerId) {
+        const btn = document.getElementById('testOneBtn');
+        if (!btn) return;
+        const isTesting = this.testingIds.has(providerId);
+        // Only update if this provider is currently selected
+        if (String(this.selectedProviderId) !== String(providerId)) return;
+        if (isTesting) {
+            btn.disabled = true;
+            btn.classList.add('is-loading');
+            btn.innerHTML = '<svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg>';
+        } else {
+            btn.disabled = false;
+            btn.classList.remove('is-loading');
+            btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>';
         }
     }
 

@@ -7,6 +7,7 @@ import urllib.request
 import urllib.error
 import json
 import logging
+import os
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -127,3 +128,103 @@ def _compare_versions(current: str, latest: str) -> bool:
         return cur_pre and not lat_pre
     except Exception:
         return False
+
+
+import tempfile
+import shutil
+import threading
+
+
+def _validate_download_url(url: str) -> bool:
+    """验证下载 URL 是否来自安全的 GitHub 域名"""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        if p.scheme != "https":
+            return False
+        host = p.hostname or ""
+        return host in ("github.com", "objects.githubusercontent.com") or host.endswith(".githubusercontent.com")
+    except Exception:
+        return False
+
+
+def download_update(download_url: str, progress_callback=None, cancel_event=None) -> str:
+    """下载更新文件到临时目录
+
+    Args:
+        download_url: .exe 文件的下载链接
+        progress_callback: 回调函数 (downloaded_bytes, total_bytes)
+        cancel_event: threading.Event，设置时取消下载
+
+    Returns:
+        下载完成的临时文件路径
+
+    Raises:
+        ValueError: URL 验证失败
+        RuntimeError: 下载被取消或网络错误
+    """
+    if not _validate_download_url(download_url):
+        raise ValueError("下载链接不安全，已阻止")
+
+    # 获取文件名
+    from urllib.parse import urlparse, unquote
+    filename = "API-Monitor-update.exe"
+    path_part = urlparse(download_url).path
+    if path_part:
+        candidate = unquote(path_part.rsplit("/", 1)[-1])
+        if candidate.lower().endswith(".exe"):
+            filename = candidate
+
+    temp_dir = tempfile.mkdtemp(prefix="apimonitor_update_")
+    temp_path = os.path.join(temp_dir, filename)
+
+    try:
+        req = urllib.request.Request(
+            download_url,
+            headers={
+                "User-Agent": "API-Monitor-Updater",
+                "Accept": "application/octet-stream",
+            },
+        )
+
+        with urllib.request.urlopen(req, timeout=60) as response:
+            total = int(response.headers.get("Content-Length", 0))
+            downloaded = 0
+            chunk_size = 65536  # 64KB
+
+            with open(temp_path, "wb") as f:
+                while True:
+                    if cancel_event and cancel_event.is_set():
+                        raise RuntimeError("下载已取消")
+
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    if progress_callback:
+                        # 每 ~100KB 或完成时回调
+                        if downloaded % (chunk_size * 2) < chunk_size or downloaded >= total:
+                            progress_callback(downloaded, total)
+
+        logger.info(f"Update downloaded to: {temp_path} ({downloaded} bytes)")
+        return temp_path
+
+    except RuntimeError:
+        # 取消或网络错误，清理临时文件
+        try:
+            os.remove(temp_path)
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
+        raise
+    except Exception as e:
+        logger.error(f"Download failed: {e}")
+        try:
+            os.remove(temp_path)
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
+        raise RuntimeError(f"下载失败: {e}")

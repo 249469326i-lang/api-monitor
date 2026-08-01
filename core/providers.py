@@ -1477,13 +1477,15 @@ def _format_provider(p: Dict) -> Dict[str, Any]:
         "default_model": p.get("default_model", ""),
         "last_test_time": p.get("last_test_time"),
         "created_at": p.get("created_at"),
-        # 每应用绑定（分页过滤用）：[{app_type,endpoint,default_model,api_format,role}]
+        # 每应用绑定（分页过滤用）：[{app_type,endpoint,default_model,api_format,reasoning_effort,context_length,role}]
         "apps": [
             {
                 "app_type": b.get("app_type"),
                 "endpoint": b.get("endpoint", ""),
                 "default_model": b.get("default_model", ""),
                 "api_format": b.get("api_format", ""),
+                "reasoning_effort": b.get("reasoning_effort", ""),
+                "context_length": b.get("context_length", 0),
                 "role": b.get("role", "备用"),
             }
             for b in (p.get("apps") or [])

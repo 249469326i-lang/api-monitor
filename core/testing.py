@@ -54,7 +54,7 @@ def _create_ssl_context() -> ssl.SSLContext:
 def _get_timeout() -> int:
     """从设置中获取超时时间（秒）"""
     try:
-        return int(_cached_setting("test_timeout") or "30")
+        return int(_cached_setting("test_timeout") or "10")
     except (ValueError, TypeError):
         return 30
 
@@ -62,7 +62,7 @@ def _get_timeout() -> int:
 def _get_retries() -> int:
     """从设置中获取重试次数"""
     try:
-        return int(_cached_setting("test_retries") or "2")
+        return int(_cached_setting("test_retries") or "1")
     except (ValueError, TypeError):
         return 2
 
@@ -561,6 +561,15 @@ def test_provider(provider_id: int, mode: str = "fast", log_callback=None) -> Di
     app_type = (provider.get("app_type") or "claude").strip()
     api_format = (provider.get("api_format") or "").strip()
 
+    # 从 apps 绑定中读取推理强度和上下文长度
+    reasoning_effort = ""
+    context_length = 0
+    for b in (provider.get("apps") or []):
+        if b.get("app_type") == app_type:
+            reasoning_effort = (b.get("reasoning_effort") or "").strip()
+            context_length = b.get("context_length") or 0
+            break
+
     if not endpoint:
         return {"success": False, "error": "未配置端点"}
 
@@ -597,8 +606,8 @@ def test_provider(provider_id: int, mode: str = "fast", log_callback=None) -> Di
                 result = _test_models_endpoint(endpoint, api_key)
             else:
                 # 完整测试：发送测试消息并验证 AI 回复
-                log("info", f"→ POST {endpoint}  发送 \"你是谁呀，小朋友\" 验证 AI 回复")
-                result = _test_chat_endpoint(endpoint, api_key, default_model, app_type, api_format)
+                log("info", f"→ POST {endpoint} | model={default_model or '默认'} | effort={reasoning_effort or '默认'} | ctx={context_length or '默认'}")
+                result = _test_chat_endpoint(endpoint, api_key, default_model, app_type, api_format, reasoning_effort=reasoning_effort, context_length=context_length)
 
             last_result = result
 
@@ -920,7 +929,7 @@ def _test_connectivity_fallback(endpoint: str, api_key: str) -> Dict[str, any]:
         return {"success": False, "error": _normalize_error_text(e) or str(e)}
 
 
-def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: str = "claude", api_format: str = "") -> Dict[str, any]:
+def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: str = "claude", api_format: str = "", reasoning_effort: str = "", context_length: int = 0) -> Dict[str, any]:
     """测试聊天端点（完整测试）
     手动指定 api_format 时优先尝试该格式；否则按 app_type 优先级依次尝试:
       - claude: Anthropic Messages → OpenAI Chat Completions → OpenAI Responses → Gemini
@@ -936,6 +945,9 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
     auth_methods = []
     auth_methods.append(("Bearer", {"Authorization": f"Bearer {api_key}"}))
     auth_methods.append(("x-api-key", {"x-api-key": api_key}))
+
+    _effort = reasoning_effort.strip() if reasoning_effort else ""
+    _max_tokens = 256
 
     attempt_errors = []
     # 死端点短路：DNS 解析失败/连接拒绝/网络不可达意味着同一 host 的
@@ -961,7 +973,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
             _fatal["dead"] = True
         elif etype == "timeout":
             _fatal["timeouts"] += 1
-            if _fatal["timeouts"] >= 2:
+            if _fatal["timeouts"] >= 1:
                 _fatal["dead"] = True
         else:
             _fatal["timeouts"] = 0
@@ -981,7 +993,9 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
         model_names = _model_candidates(model) or ["claude-haiku-4-5"]
         paths = ["messages"] if endpoint.endswith("/v1") else ["v1/messages", "messages"]
         for claude_model in model_names:
-            body = {"model": claude_model, "max_tokens": 32, "messages": [{"role": "user", "content": "你是谁呀，小朋友"}]}
+            body = {"model": claude_model, "max_tokens": _max_tokens, "messages": [{"role": "user", "content": "你是谁呀，小朋友"}]}
+            if _effort:
+                body["reasoning_effort"] = _effort
             for path in paths:
                 for auth_name, auth_h in auth_methods:
                     if _fatal["dead"]:
@@ -996,7 +1010,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
                             if snippet:
                                 return {
                                     "success": True,
-                                    "detail": f"AI 正常回复 ({auth_name})",
+                                    "detail": f"AI 正常回复 ({auth_name} | model={claude_model}" + (f" | effort={_effort}" if _effort else "") + ")",
                                     "response_snippet": snippet,
                                     "api_format": "anthropic_messages",
                                 }
@@ -1014,7 +1028,9 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
             oai_model = "deepseek-chat"
         else:
             oai_model = "gpt-3.5-turbo"
-        body = {"model": oai_model, "max_tokens": 32, "messages": [{"role": "user", "content": "你是谁呀，小朋友"}]}
+        body = {"model": oai_model, "max_tokens": _max_tokens, "messages": [{"role": "user", "content": "你是谁呀，小朋友"}]}
+        if _effort:
+            body["reasoning_effort"] = _effort
         urls = [f"{endpoint}/chat/completions"]
         if not endpoint.endswith("/v1"):
             urls.append(f"{endpoint}/v1/chat/completions")
@@ -1036,7 +1052,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
                 if result["success"]:
                     snippet = _extract_response_snippet(result.get("body"), "auto")
                     if snippet:
-                        return {"success": True, "detail": "AI 正常回复 (OpenAI)", "response_snippet": snippet, "api_format": "openai_chat"}
+                        return {"success": True, "detail": f"AI 正常回复 (OpenAI | model={oai_model}" + (f" | effort={_effort}" if _effort else "") + ")", "response_snippet": snippet, "api_format": "openai_chat"}
                     _record_error(f"openai_chat{path_tail}/{oai_model}", result)
                 else:
                     _record_error(f"openai_chat{path_tail}/{oai_model}", result)
@@ -1047,6 +1063,8 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
     def _try_openai_responses():
         oai_model = model if model else "gpt-4o-mini"
         body = {"model": oai_model, "input": "你是谁呀，小朋友"}
+        if _effort:
+            body["reasoning_effort"] = _effort
         paths = ["responses"]
         if not endpoint.endswith("/v1"):
             paths.append("v1/responses")
@@ -1062,7 +1080,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
                 if result["success"]:
                     snippet = _extract_response_snippet(result.get("body"), "auto")
                     if snippet:
-                        return {"success": True, "detail": "AI 正常回复 (Responses)", "response_snippet": snippet, "api_format": "openai_responses"}
+                        return {"success": True, "detail": f"AI 正常回复 (Responses | model={oai_model}" + (f" | effort={_effort}" if _effort else "") + ")", "response_snippet": snippet, "api_format": "openai_responses"}
                     _record_error(f"openai_responses/{path}/{oai_model}", result)
                 else:
                     _record_error(f"openai_responses/{path}/{oai_model}", result)
@@ -1110,7 +1128,8 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
         order = ["anthropic_messages", "openai_chat", "openai_responses", "gemini_native"]
 
     if api_format in format_funcs:
-        order = [api_format] + [fmt for fmt in order if fmt != api_format]
+        # 用户已指定 API 格式，只尝试该格式，不轮询其他格式（避免超长等待）
+        order = [api_format]
 
     for fmt_key in order:
         if _fatal["dead"]:

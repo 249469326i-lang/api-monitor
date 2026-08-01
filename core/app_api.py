@@ -1143,6 +1143,149 @@ class API:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def download_update(self, download_url):
+        """在后台线程下载更新文件，通过 evaluate_js 推送进度"""
+        try:
+            from . import updater
+
+            # 取消之前的下载（如果有）
+            if hasattr(self, '_update_cancel') and self._update_cancel:
+                self._update_cancel.set()
+
+            self._update_cancel = threading.Event()
+
+            def _progress_cb(downloaded, total):
+                if self._window:
+                    if total > 0:
+                        percent = round(downloaded * 100 / total, 1)
+                        dl_mb = round(downloaded / 1048576, 1)
+                        total_mb = round(total / 1048576, 1)
+                    else:
+                        percent = -1
+                        dl_mb = round(downloaded / 1048576, 1)
+                        total_mb = 0
+                    js = f"if(window.app)window.app.updateDownloadProgress({percent},{dl_mb},{total_mb});"
+                    try:
+                        self._window.evaluate_js(js)
+                    except Exception:
+                        pass
+
+            def _download_thread():
+                try:
+                    temp_path = updater.download_update(
+                        download_url,
+                        progress_callback=_progress_cb,
+                        cancel_event=self._update_cancel,
+                    )
+                    if self._window:
+                        js = f'if(window.app)window.app.updateDownloadComplete("{temp_path.replace(chr(92),chr(92)*2)}");'
+                        try:
+                            self._window.evaluate_js(js)
+                        except Exception:
+                            pass
+                except RuntimeError as e:
+                    if "取消" in str(e):
+                        logger.info("Update download cancelled by user")
+                        return
+                    logger.error(f"Update download error: {e}")
+                    if self._window:
+                        import json as _json; err_msg = _json.dumps(str(e))[1:-1]
+                        js = f'if(window.app)window.app.updateDownloadError("{err_msg}");'
+                        try:
+                            self._window.evaluate_js(js)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.error(f"Update download failed: {e}")
+                    if self._window:
+                        import json as _json; err_msg = _json.dumps(str(e))[1:-1]
+                        js = f'if(window.app)window.app.updateDownloadError("{err_msg}");'
+                        try:
+                            self._window.evaluate_js(js)
+                        except Exception:
+                            pass
+
+            t = threading.Thread(target=_download_thread, daemon=True)
+            t.start()
+            self._update_thread = t
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def cancel_update_download(self):
+        """取消正在进行的下载"""
+        try:
+            if hasattr(self, '_update_cancel') and self._update_cancel:
+                self._update_cancel.set()
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def install_update(self, temp_exe_path):
+        """用批处理脚本替换 exe 并重启"""
+        import subprocess
+        import sys
+
+        try:
+            if not temp_exe_path or not os.path.isfile(temp_exe_path):
+                return {"success": False, "error": "更新文件不存在"}
+
+            if not temp_exe_path.lower().endswith(".exe"):
+                return {"success": False, "error": "更新文件不是有效的 exe"}
+
+            current_exe = sys.executable
+            if not current_exe or not os.path.isfile(current_exe):
+                return {"success": False, "error": "无法确定当前程序路径"}
+
+            # 创建批处理脚本
+            import tempfile
+            bat_path = os.path.join(tempfile.gettempdir(), "apimonitor_updater.bat")
+
+            bat_content = f"""@echo off
+chcp 65001 >nul 2>&1
+echo 正在等待程序退出...
+timeout /t 3 /nobreak >nul
+
+echo 正在安装更新...
+copy /Y "{temp_exe_path}" "{current_exe}" >nul 2>&1
+if errorlevel 1 (
+    echo 替换文件失败，请手动替换
+    timeout /t 5 /nobreak >nul
+    exit /b 1
+)
+
+echo 更新完成，正在重启...
+start "" "{current_exe}"
+
+del "{temp_exe_path}" >nul 2>&1
+del "%~f0" >nul 2>&1
+"""
+
+            with open(bat_path, "w", encoding="utf-8") as f:
+                f.write(bat_content)
+
+            logger.info(f"Launching updater batch: {bat_path}")
+
+            # 启动批处理（分离进程）
+            subprocess.Popen(
+                ["cmd", "/c", bat_path],
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008,  # DETACHED_PROCESS
+                close_fds=True,
+            )
+
+            # 关闭当前应用
+            self._force_quit = True
+            if self._window:
+                try:
+                    self._window.destroy()
+                except Exception:
+                    pass
+
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"Install update failed: {e}")
+            return {"success": False, "error": str(e)}
+
     # ────────────────── 定时测试 ──────────────────
 
     def get_scheduler_status(self):
