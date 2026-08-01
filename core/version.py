@@ -3,5 +3,5 @@
 发版请用 bump_version.py，不要手动改。
 """
 
-__version__ = "3.1.9"
+__version__ = "3.2.8"
 APP_REPO = "https://github.com/249469326i-lang/api-monitor"

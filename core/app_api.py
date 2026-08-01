@@ -1246,40 +1246,34 @@ class API:
 chcp 65001 >nul 2>&1
 set _MEIPASS=
 set _MEIPASS2=
-echo 正在等待程序退出...
 
-REM 循环等待进程退出（最多 15 秒）
+REM 循环等待进程退出（最多 10 秒）
 set /a wait_count=0
 :wait_loop
 tasklist /fi "imagename eq {current_exe_name}" 2>nul | find /i "{current_exe_name}" >nul
 if %errorlevel% equ 0 (
     set /a wait_count+=1
-    if %wait_count% geq 30 (
-        echo 程序未退出，强制结束...
+    if %wait_count% geq 20 (
         taskkill /f /im "{current_exe_name}" >nul 2>&1
-        timeout /t 2 /nobreak >nul
+        ping 127.0.0.1 -n 2 >nul 2>&1
         goto try_copy
     )
-    timeout /t 1 /nobreak >nul
+    ping 127.0.0.1 -n 2 >nul 2>&1
     goto wait_loop
 )
 
 :try_copy
-echo 正在安装更新...
 copy /Y "{temp_exe_path}" "{current_exe}" >nul 2>&1
 if errorlevel 1 (
-    echo 替换文件失败，尝试重命名旧文件...
     rename "{current_exe}" "API-Monitor.old.exe" >nul 2>&1
     copy /Y "{temp_exe_path}" "{current_exe}" >nul 2>&1
     if errorlevel 1 (
-        echo 替换文件失败，请手动替换
-        timeout /t 5 /nobreak >nul
+        ping 127.0.0.1 -n 3 >nul 2>&1
         exit /b 1
     )
     del "{current_exe}.old.exe" >nul 2>&1
 )
 
-echo 更新完成，正在重启...
 start "" "{current_exe}"
 
 del "{temp_exe_path}" >nul 2>&1
