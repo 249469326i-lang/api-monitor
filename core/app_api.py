@@ -1289,11 +1289,12 @@ del "%~f0" >nul 2>&1
 
             logger.info(f"Launching updater batch: {bat_path}")
 
-            # 启动批处理（分离进程）
+            # 启动批处理（用 start 命令脱离父进程，避免应用退出时被终止）
             subprocess.Popen(
-                ["cmd", "/c", bat_path],
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008,  # DETACHED_PROCESS
+                ["cmd", "/c", "start", "/b", "", bat_path],
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000,  # CREATE_NO_WINDOW
                 close_fds=True,
+                shell=False,
             )
 
             # 关闭当前应用
