@@ -1278,9 +1278,7 @@ if errorlevel 1 (
 )
 
 echo 更新完成，正在重启...
-
-REM 用 PowerShell Start-Process 启动新进程（完全脱离 _MEIPASS 环境变量）
-powershell -NoProfile -Command "Start-Process -FilePath '{current_exe}'"
+start "" "{current_exe}"
 
 del "{temp_exe_path}" >nul 2>&1
 del "%~f0" >nul 2>&1
@@ -1292,11 +1290,14 @@ del "%~f0" >nul 2>&1
             logger.info(f"Launching updater batch: {bat_path}")
 
             # 启动批处理（用 start 命令脱离父进程，避免应用退出时被终止）
+            # 关键：清除 _MEIPASS 环境变量，否则新 exe 会找旧临时目录的 python311.dll
+            clean_env = {k: v for k, v in os.environ.items() if not k.startswith("_MEI")}
             subprocess.Popen(
                 ["cmd", "/c", "start", "/b", "", bat_path],
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000,  # CREATE_NO_WINDOW
                 close_fds=True,
                 shell=False,
+                env=clean_env,
             )
 
             # 关闭当前应用
