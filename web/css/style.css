@@ -1029,6 +1029,7 @@ body.window-anim-show .app {
 .cli-result {
     display: flex;
     align-items: flex-start;
+    flex-wrap: nowrap;
     gap: 8px;
     padding: 10px 12px;
     margin-bottom: 10px;
@@ -1036,6 +1037,7 @@ body.window-anim-show .app {
     box-shadow: 3px 3px 0 var(--px-dark);
     font-size: 12px;
     line-height: 1.5;
+    position: relative;
 }
 .cli-result.ok {
     background: #0a2e1a;
@@ -1081,8 +1083,9 @@ body.window-anim-show .app {
     color: #fff;
 }
 .cli-result-body {
-    flex: 1;
+    flex: 1 1 auto;
     min-width: 0;
+    max-width: calc(100% - 120px);
     word-break: break-word;
     color: #ccc;
     font-size: 11px;
@@ -1090,10 +1093,11 @@ body.window-anim-show .app {
 .cli-result.ok .cli-result-body { color: #8f8; }
 .cli-result.err .cli-result-body { color: #f88; }
 .cli-result-time {
-    flex-shrink: 0;
+    display: inline;
+    white-space: nowrap;
     font-size: 10px;
     color: #666;
-    margin-top: 2px;
+    margin-left: 6px;
 }
 .cli-info-line {
     padding: 1px 4px;
@@ -1902,7 +1906,9 @@ body.window-anim-show .app {
     background: #fff;
     flex: 1 1 0;
     min-height: 0;
-    overflow: hidden;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 .fade-in { animation: fade-in 120ms steps(2, end); }
 @keyframes fade-in {

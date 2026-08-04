@@ -509,6 +509,8 @@ def _set_claude_current(provider: Dict[str, Any], binding: Optional[Dict[str, An
     claude_base_url = _get_claude_base_url(endpoint)
     api_key = provider.get("api_key") or ""
     model = b.get("default_model") or ""
+    reasoning_effort = (b.get("reasoning_effort") or "").strip()
+    context_length = b.get("context_length") or 0
 
     if not endpoint:
         return {"success": False, "error": "未配置端点"}
@@ -802,11 +804,160 @@ def _read_codex_effective_config() -> Dict[str, str]:
     }
 
 
-def _write_codex_config(provider: Dict[str, Any], binding: Optional[Dict[str, Any]] = None) -> str:
+def _codex_catalog_entry(model: str) -> dict:
+    """生成 Codex 模型目录（model_catalog_json）单条记录。
+
+    字段集对齐 Codex 0.146 官方模型目录 schema（models_cache.json），
+    缺字段会导致 Codex 启动时解析失败。
+    """
+    return {
+        "slug": model,
+        "display_name": model,
+        "description": model,
+        "base_instructions": (
+            f"You are Codex, a coding agent based on {model}. "
+            "You and the user share the same workspace and collaborate to achieve the user's goals."
+        ),
+        "model_messages": None,
+        "include_skills_usage_instructions": False,
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Fast responses with lighter reasoning"},
+            {"effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks"},
+            {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 0,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": None,
+        "upgrade": None,
+        "default_reasoning_summary": "none",
+        "support_verbosity": False,
+        "default_verbosity": "low",
+        # apply_patch 在 0.146 只有 freeform（type:"custom"）一种形态，
+        # 多数第三方中转拒绝 custom 工具，故置 null 不提供（用 shell 编辑）。
+        "apply_patch_tool_type": None,
+        "web_search_tool_type": "text_and_image",
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "supports_parallel_tool_calls": True,
+        "supports_image_detail_original": False,
+        "context_window": 200000,
+        "max_context_window": 200000,
+        "comp_hash": "3000",
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"],
+        "supports_search_tool": False,
+        "use_responses_lite": False,
+        # tool_mode: "code_mode_only" 会让 Codex 只发单个 custom 工具
+        # （{type:"custom"}），多数第三方中转不支持；direct = 经典 function
+        # 工具（execute_bash/apply_patch），兼容性最好。multi_agent_version
+        # 置空避免附带 collaboration / spawn_agent namespace。
+        "tool_mode": "direct",
+        "multi_agent_version": None,
+    }
+
+
+def _get_codex_catalog_path() -> str:
+    """Codex 自定义模型目录文件路径（应用数据目录内）。"""
+    from . import paths
+    return os.path.join(paths.get_data_dir(), "codex_model_catalog.json")
+
+
+def _write_codex_catalog(models) -> str:
+    """把模型列表写入 model_catalog_json 文件，返回文件路径；失败返回空串。
+
+    目录仅包含本供应商真实支持的模型，让 Codex 模型选择器不再显示官方模型名。
+    """
+    if not models:
+        return ""
+    entries = []
+    seen = set()
+    for m in models:
+        m = (m or "").strip()
+        if not m or m in seen:
+            continue
+        seen.add(m)
+        entries.append(_codex_catalog_entry(m))
+    if not entries:
+        return ""
+    path = _get_codex_catalog_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({"models": entries}, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        return path
+    except Exception:
+        return ""
+
+
+def _resolve_codex_model(provider: Dict[str, Any], binding: Dict[str, Any]) -> tuple:
+    """解析要写入 config.toml 的默认模型。
+
+    绑定有 default_model 直接用；为空时尝试从端点 /models 拉取，
+    取第一个作为默认模型，并返回可写入 catalog 的完整模型列表。
+    返回 (model, catalog_models, warning)；warning 为需要提示用户的信息（可为空串）。
+    拉取失败且无配置时 model 为空。
+    """
+    b = binding or provider
+    model = (b.get("default_model") or "").strip()
+    endpoint = (b.get("endpoint") or "").strip()
+    api_format = (b.get("api_format") or "").strip().lower()
+    api_key = (provider.get("api_key") or "").strip()
+    warning = ""
+
+    catalog_models = None
+    if endpoint:
+        try:
+            from . import testing
+            # Codex 只支持 Responses API：拉列表时按 supports_responses 能力过滤
+            fetched = testing.fetch_models(
+                endpoint, api_key, api_format,
+                default_model=model, responses_only=True,
+            )
+            if isinstance(fetched, dict) and fetched.get("success"):
+                models = [m.strip() for m in (fetched.get("models") or []) if isinstance(m, str) and m.strip()]
+                if models:
+                    responses_filtered = bool(fetched.get("responses_filtered"))
+                    if not model:
+                        model = models[0]
+                    elif model not in models:
+                        if responses_filtered:
+                            # 用户配置的模型不支持 Responses API → 优先换同系列兼容模型
+                            match = next((m for m in models if m.startswith(model)), None)
+                            if match is None:
+                                match = models[0]
+                            warning = (
+                                f"{model} 不支持 Responses API，已改用 {match}。"
+                                "Codex 自 2026-02 起仅支持 Responses 接口"
+                            )
+                            model = match
+                        else:
+                            # 无能力信息：模型列表可能只是别名，保留用户配置
+                            models = [model] + models
+                    catalog_models = models
+        except Exception:
+            catalog_models = None
+    if catalog_models is None and model:
+        catalog_models = [model]
+    return model, catalog_models, warning
+
+
+def _write_codex_config(provider: Dict[str, Any], binding: Optional[Dict[str, Any]] = None,
+                        catalog_models: Optional[list] = None,
+                        model: str = "") -> str:
     """
     把 provider 写入 ~/.codex/config.toml(仅更新 model / model_provider 与
     [model_providers.api_monitor] 表,保留注释与其它配置)。返回写入后的文本。
     binding 为 codex 绑定（含独立端点/模型/格式），缺省回退 provider 顶层字段。
+    model 为已解析的默认模型（自动回填时绑定里可能还没有值）。
     """
     path = _get_codex_config_path()
     text = ""
@@ -820,25 +971,41 @@ def _write_codex_config(provider: Dict[str, Any], binding: Optional[Dict[str, An
         text = ""
 
     b = binding or provider
-    model = (b.get("default_model") or "").strip()
+    if not model:
+        model = (b.get("default_model") or "").strip()
     endpoint = (b.get("endpoint") or "").strip().rstrip("/")
     name = (provider.get("name") or "").strip() or CODEX_PROVIDER_SLUG
     reasoning_effort = (b.get("reasoning_effort") or "").strip()
     context_length = b.get("context_length") or 0
+    # Codex 自 2026-02 起仅支持 Responses API（wire_api="chat" 已被移除），
+    # 无论绑定 api_format 是什么，写 Codex 配置一律用 responses。
+    wire_api = "responses"
 
     top: Dict[str, Any] = {"model_provider": CODEX_PROVIDER_SLUG}
     if model:
         top["model"] = model
+    # model_catalog_json: 指向只含本供应商模型的自定义目录，模型选择器不再显示官方模型名
+    if catalog_models:
+        catalog_path = _write_codex_catalog(catalog_models)
+        if catalog_path:
+            top["model_catalog_json"] = catalog_path
     # reasoning_effort 写入顶层（Codex 会透传给支持的模型）
     if reasoning_effort:
         top["model_reasoning_effort"] = reasoning_effort
     text = _toml_set_keys(text, top, section=None)
 
+    # base_url: Codex 会在 base_url 后拼 "/responses"（Responses API），
+    # 而中转厂标准路径是 /v1/responses（/v1/models 同理）。endpoint 不带
+    # /v1 时补上，否则会打到 /responses 得到 405。
+    base_url = endpoint
+    if wire_api == "responses" and not base_url.rstrip("/").endswith("/v1"):
+        base_url = base_url.rstrip("/") + "/v1"
+
     section = f"model_providers.{CODEX_PROVIDER_SLUG}"
     section_keys: Dict[str, Any] = {
         "name": name,
-        "base_url": endpoint,
-        "wire_api": "responses",
+        "base_url": base_url,
+        "wire_api": wire_api,
         "requires_openai_auth": False,
         # context_length: 控制 Codex 上下文窗口大小（0 = 不写入，用模型默认）
         "context_window": int(context_length) if context_length and int(context_length) > 0 else None,
@@ -851,6 +1018,16 @@ def _write_codex_config(provider: Dict[str, Any], binding: Optional[Dict[str, An
     if api_key:
         section_keys["experimental_bearer_token"] = api_key
     text = _toml_set_keys(text, section_keys, section=section)
+
+    # 第三方中继通常只接受 function / web_search 工具。Codex 默认启用的
+    # multi-agent 会把工具打包成 type:"namespace"（multi_agent_v1），freeform
+    # apply_patch 发 type:"custom"，MCP 服务器工具也归到 namespace 下，
+    # 都会被中继以 tool.namespace / tool.custom 拒绝，因此统一在配置里关闭。
+    text = _toml_set_keys(text, {
+        "multi_agent": False,
+        "apply_patch_freeform": False,
+    }, section="features")
+    text = _toml_set_keys(text, {"enabled": False}, section="mcp_servers.node_repl")
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = path + ".tmp"
@@ -868,8 +1045,21 @@ def _set_codex_current(provider: Dict[str, Any], binding: Optional[Dict[str, Any
     b = binding or provider
     if not (b.get("endpoint") or "").strip():
         return {"success": False, "error": "未配置端点"}
+    # 默认模型为空时自动从端点拉取并回填；仍拿不到则明确报错，
+    # 避免 Codex 落到官方模型名导致第三方 API 报"模型不存在"。
+    model, catalog_models, warning = _resolve_codex_model(provider, b)
+    if not model:
+        return {
+            "success": False,
+            "error": "该供应商未配置默认模型，且无法从端点获取模型列表。请先在 API Monitor 中填写默认模型",
+        }
+    # 回填实际生效的模型（自动填充或修正后），让 UI 与配置保持一致
     try:
-        _write_codex_config(provider, b)
+        db.update_binding_default_model(provider["id"], "codex", model)
+    except Exception:
+        pass
+    try:
+        _write_codex_config(provider, b, catalog_models=catalog_models, model=model)
     except Exception as e:
         return {"success": False, "error": f"写入 config.toml 失败: {e}"}
 
@@ -877,7 +1067,10 @@ def _set_codex_current(provider: Dict[str, Any], binding: Optional[Dict[str, Any
     db.set_setting("codex_current_mode", "provider")
 
     name = provider.get("name", "")
-    return {"success": True, "message": f"{name} 已设为当前 Codex 配置"}
+    message = f"{name} 已设为当前 Codex 配置"
+    if warning:
+        message = f"{message}（{warning}）"
+    return {"success": True, "message": message}
 
 
 # ────────────────── 官方 / 第三方模式 ──────────────────

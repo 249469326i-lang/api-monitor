@@ -44,6 +44,47 @@ class _FakeResponse:
         return json.dumps(self._payload).encode("utf-8")
 
 
+def _adapt_http_open(fake_urlopen):
+    """把基于 urllib.request.urlopen 的 fake(req) 适配成 testing._http_open 签名
+    (method, url, headers, body, connect_timeout, read_timeout, _redirects)。"""
+    class _Req:
+        __slots__ = ("full_url", "data", "method", "headers")
+
+        def header_items(self):
+            return list((self.headers or {}).items())
+
+    def fake_http_open(method, url, headers, body=None, connect_timeout=None,
+                       read_timeout=None, _redirects=0):
+        req = _Req()
+        req.full_url = url
+        req.data = body
+        req.method = method
+        req.headers = headers
+        resp = fake_urlopen(req)
+        return resp.status, resp.read()
+
+    return fake_http_open
+
+
+def _is_probe_body(body):
+    """识别 _probe_api_format 发送的探测请求体（max_tokens=1 / input="." / contents）。"""
+    if not body:
+        return False
+    return (body.get("max_tokens") == 1 or "input" in body or "contents" in body)
+
+
+def _probe_tolerant(fake_urlopen):
+    """包装 fake：探测请求直接回 200（探测只看状态码），
+    让自动模式测试避免探测请求干扰业务断言（calls / max_tokens 等）。"""
+    def wrapper(req, timeout=None, context=None):
+        body = json.loads(req.data.decode("utf-8")) if req.data else {}
+        if _is_probe_body(body):
+            return _FakeResponse({"content": [{"type": "text", "text": "probe"}]})
+        return fake_urlopen(req, timeout=timeout, context=context)
+
+    return wrapper
+
+
 class FetchModelsIsolationTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
@@ -189,7 +230,7 @@ class FetchModelsIsolationTest(unittest.TestCase):
                 fp=io.BytesIO(b""),
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(_probe_tolerant(fake_urlopen))):
             result = testing._test_chat_endpoint(
                 "https://same.example/v1",
                 "sk-own",
@@ -235,7 +276,7 @@ class FetchModelsCompletenessTest(unittest.TestCase):
                 fp=io.BytesIO(b""),
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
             result = testing.fetch_models(
                 "https://proxy.example/anthropic",
                 "",
@@ -258,7 +299,7 @@ class FetchModelsCompletenessTest(unittest.TestCase):
         def fake_urlopen(req, timeout=None, context=None):
             return _FakeResponse(responses[req.full_url])
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
             result = testing.fetch_models(
                 "https://proxy.example",
                 "",
@@ -281,7 +322,7 @@ class FetchModelsCompletenessTest(unittest.TestCase):
                 fp=io.BytesIO(b""),
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
             result = testing.fetch_models(
                 "https://proxy.example",
                 "",
@@ -290,6 +331,49 @@ class FetchModelsCompletenessTest(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["models"], ["local-a", "local-b"])
+
+    def test_fetch_models_responses_only_filters_by_capability(self):
+        """responses_only=True 时按 supports_responses 能力过滤模型。"""
+
+        def fake_urlopen(req, timeout=None, context=None):
+            return _FakeResponse({
+                "data": [
+                    {"id": "deepseek-v4-flash", "supports_responses": False},
+                    {"id": "qwen3.8-max", "supports_responses": True},
+                    {"id": "deepseek-v4-flash-0731", "supports_responses": True},
+                    {"id": "glm-5.2"},
+                ]
+            })
+
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
+            result = testing.fetch_models("https://proxy.example", "", responses_only=True)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["models"], ["qwen3.8-max", "deepseek-v4-flash-0731"])
+
+    def test_fetch_models_responses_only_keeps_all_when_capability_unknown(self):
+        """旧中继不带 supports_responses 字段 → responses_only 不过滤。"""
+
+        def fake_urlopen(req, timeout=None, context=None):
+            return _FakeResponse({"data": [{"id": "a"}, {"id": "b"}]})
+
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
+            result = testing.fetch_models("https://proxy.example", "", responses_only=True)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["models"], ["a", "b"])
+
+    def test_fetch_models_responses_only_none_supported_errors(self):
+        """全部模型显式不支持 responses → 明确报错，防止写出必坏的 Codex 配置。"""
+
+        def fake_urlopen(req, timeout=None, context=None):
+            return _FakeResponse({"data": [{"id": "a", "supports_responses": False}]})
+
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
+            result = testing.fetch_models("https://proxy.example", "", responses_only=True)
+
+        self.assertFalse(result["success"])
+        self.assertIn("没有支持 Responses API", result["error"])
 
     def test_fetch_models_does_not_show_claude_fallback_for_third_party_endpoint(self):
         def fake_urlopen(req, timeout=None, context=None):
@@ -301,7 +385,7 @@ class FetchModelsCompletenessTest(unittest.TestCase):
                 fp=io.BytesIO(b""),
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
             result = testing.fetch_models(
                 "https://longcat.chat/api/v1",
                 "sk-longcat",
@@ -321,7 +405,7 @@ class FetchModelsCompletenessTest(unittest.TestCase):
                 fp=io.BytesIO(b""),
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
             result = testing.fetch_models(
                 "https://api.anthropic.com/v1",
                 "sk-ant",
@@ -348,7 +432,7 @@ class FetchModelsCompletenessTest(unittest.TestCase):
                 fp=io.BytesIO(b""),
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
             result = testing.fetch_models(
                 "https://api.anthropic.com/v1",
                 "sk-test",
@@ -384,7 +468,7 @@ class FetchModelsCompletenessTest(unittest.TestCase):
                 }
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
             result = testing.fetch_models(
                 "https://generativelanguage.googleapis.com/v1beta",
                 "gemini-key",
@@ -446,7 +530,7 @@ class ValidatorTest(unittest.TestCase):
                 fp=io.BytesIO(b""),
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
             result = testing.fetch_models("https://html.example", "")
 
         self.assertTrue(result["success"])
@@ -460,7 +544,7 @@ class ChatEndpointTest(unittest.TestCase):
         def fake_urlopen(req, timeout=None, context=None):
             calls.append(req.full_url)
             body = json.loads(req.data.decode("utf-8"))
-            self.assertEqual(body["max_tokens"], 32)
+            self.assertEqual(body["max_tokens"], 256)
             if req.full_url == "https://proxy.example/messages":
                 return _FakeResponse("<!doctype html><html></html>", raw=True)
             if req.full_url == "https://proxy.example/v1/messages":
@@ -476,7 +560,7 @@ class ChatEndpointTest(unittest.TestCase):
                 )
             self.fail(f"unexpected URL {req.full_url}")
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(_probe_tolerant(fake_urlopen))):
             result = testing._test_chat_endpoint(
                 "https://proxy.example",
                 "sk-test",
@@ -519,12 +603,12 @@ class ChatEndpointTest(unittest.TestCase):
                 fp=io.BytesIO(b""),
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(_probe_tolerant(fake_urlopen))):
             result = testing._test_chat_endpoint(
                 "https://api.deepseek.com/v1",
                 "sk-test",
                 "",
-                "claude",
+                "hermes",
             )
 
         self.assertTrue(result["success"])
@@ -557,12 +641,12 @@ class ChatEndpointTest(unittest.TestCase):
                 fp=io.BytesIO(b""),
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(_probe_tolerant(fake_urlopen))):
             result = testing._test_chat_endpoint(
                 "https://api.deepseek.com/anthropic",
                 "sk-test",
                 "",
-                "claude",
+                "hermes",
             )
 
         self.assertTrue(result["success"])
@@ -583,7 +667,7 @@ class ChatEndpointTest(unittest.TestCase):
                 }
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
             result = testing._test_chat_endpoint(
                 "https://api.deepseek.com/anthropic",
                 "sk-test",
@@ -610,7 +694,9 @@ class ChatEndpointTest(unittest.TestCase):
 
         self.assertEqual(testing._extract_response_snippet(json.dumps(body), "auto"), "好的")
 
-    def test_manual_openai_chat_format_is_tried_before_anthropic(self):
+    def test_configured_openai_chat_format_only_tests_that_format(self):
+        """配置了 api_format 时只定向测试该格式（当前模型 + 推理强度 + 上下文长度）：
+        不再探测/扫描其它协议，整个测试只发 1 个请求，保证 CLI 测试快速完成。"""
         calls = []
 
         def fake_urlopen(req, timeout=None, context=None):
@@ -635,7 +721,7 @@ class ChatEndpointTest(unittest.TestCase):
                 fp=io.BytesIO(b""),
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
             result = testing._test_chat_endpoint(
                 "https://proxy.example/v1",
                 "sk-test",
@@ -646,7 +732,43 @@ class ChatEndpointTest(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["api_format"], "openai_chat")
-        self.assertEqual(calls[0], "https://proxy.example/v1/chat/completions")
+        # 定向测试：无探测、无其它格式扫描，只发 1 个请求
+        self.assertEqual(calls, ["https://proxy.example/v1/chat/completions"])
+
+    def test_configured_format_uses_model_effort_and_context_length(self):
+        """定向测试请求必须携带当前选择的模型、推理强度与上下文长度。"""
+        captured = {}
+
+        def fake_urlopen(req, timeout=None, context=None):
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return _FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "Hello",
+                            }
+                        }
+                    ]
+                }
+            )
+
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
+            result = testing._test_chat_endpoint(
+                "https://proxy.example/v1",
+                "sk-test",
+                "gpt-4o-mini",
+                "claude",
+                "openai_chat",
+                reasoning_effort="high",
+                context_length=65536,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(captured["body"]["model"], "gpt-4o-mini")
+        self.assertEqual(captured["body"]["reasoning_effort"], "high")
+        self.assertEqual(captured["body"]["max_tokens"], 65536)
 
 
 class CodexConfigTest(unittest.TestCase):
@@ -663,6 +785,13 @@ class CodexConfigTest(unittest.TestCase):
         os.environ["HOME"] = self._tmp
         os.environ["API_MONITOR_DATA_DIR"] = os.path.join(self._tmp, "data")
         db.init_db()
+        # 统一 mock 端点模型列表，避免 set_current 写配置时打真实网络
+        self._fetch_models_patcher = patch(
+            "core.testing.fetch_models",
+            return_value={"success": True, "models": ["deepseek-v4-flash", "glm-5.2"]},
+        )
+        self._fetch_models_mock = self._fetch_models_patcher.start()
+        self.addCleanup(self._fetch_models_patcher.stop)
 
     def tearDown(self):
         if self._old_appdata is None:
@@ -729,7 +858,7 @@ class CodexConfigTest(unittest.TestCase):
         self.assertEqual(parsed["model_provider"], "api_monitor")
         self.assertEqual(parsed["model"], "gpt-5.6-sol")
         section = parsed["model_providers"]["api_monitor"]
-        self.assertEqual(section["base_url"], "https://api.picpi.top")
+        self.assertEqual(section["base_url"], "https://api.picpi.top/v1")
         self.assertNotIn("env_key", section)
         self.assertEqual(section["experimental_bearer_token"], "sk-test-123")
         self.assertEqual(section["wire_api"], "responses")
@@ -947,6 +1076,171 @@ class CodexConfigTest(unittest.TestCase):
             json.dump({"env": {}}, f)
         providers.sync_current_from_settings()
         self.assertEqual(providers.get_current_modes()["claude"]["mode"], "official")
+
+    def test_codex_wire_api_always_responses(self):
+        """Codex 自 2026-02 起仅支持 Responses API：即使绑定 api_format=openai_chat，
+        wire_api 也必须写 responses，避免 Codex 启动报错。"""
+        pid = db.add_provider(
+            {
+                "name": "TokenRhythm",
+                "apps": [
+                    {"app_type": "codex", "endpoint": "https://tokenrhythm.studio",
+                     "default_model": "deepseek-v4-flash", "api_format": "openai_chat"},
+                ],
+                "api_key": "sk-tr-123",
+            }
+        )
+        self.assertTrue(providers.set_current_provider(pid, "codex")["success"])
+        with open(self._codex_config_path(), "r", encoding="utf-8") as f:
+            cfg = tomllib.loads(f.read())
+        section = cfg["model_providers"]["api_monitor"]
+        self.assertEqual(section["wire_api"], "responses")
+        self.assertEqual(cfg["model"], "deepseek-v4-flash")
+
+    def test_codex_unsupported_model_corrected_to_responses_model(self):
+        """绑定配置的模型不支持 Responses API（能力过滤后）→ 优先换同系列兼容模型并提示。"""
+        pid = db.add_provider(
+            {
+                "name": "TokenRhythm",
+                "apps": [
+                    {"app_type": "codex", "endpoint": "https://tokenrhythm.studio",
+                     "default_model": "deepseek-v4-flash", "api_format": "openai_chat"},
+                ],
+                "api_key": "sk-tr-123",
+            }
+        )
+        self._fetch_models_mock.return_value = {
+            "success": True,
+            "models": ["qwen3.7-max", "qwen3.8-max", "deepseek-v4-flash-0731"],
+            "responses_filtered": True,
+        }
+        result = providers.set_current_provider(pid, "codex")
+        self.assertTrue(result["success"])
+        self.assertIn("已改用 deepseek-v4-flash-0731", result["message"])
+        with open(self._codex_config_path(), "r", encoding="utf-8") as f:
+            cfg = tomllib.loads(f.read())
+        self.assertEqual(cfg["model"], "deepseek-v4-flash-0731")
+        self.assertEqual(cfg["model_providers"]["api_monitor"]["wire_api"], "responses")
+        # 目录只含支持 responses 的模型
+        with open(cfg["model_catalog_json"], "r", encoding="utf-8") as f:
+            catalog = json.load(f)
+        slugs = [m["slug"] for m in catalog["models"]]
+        self.assertEqual(slugs, ["qwen3.7-max", "qwen3.8-max", "deepseek-v4-flash-0731"])
+        # 修正后的模型回填绑定，UI 可见
+        p = db.get_provider_by_id(pid)
+        codex_b = next(b for b in p["apps"] if b["app_type"] == "codex")
+        self.assertEqual(codex_b["default_model"], "deepseek-v4-flash-0731")
+
+    def test_codex_configured_model_kept_when_no_capability_info(self):
+        """旧中继无能力字段 → 用户配置的模型原样保留，不被误改。"""
+        pid = db.add_provider(
+            {
+                "name": "Legacy",
+                "apps": [
+                    {"app_type": "codex", "endpoint": "https://legacy.example/v1",
+                     "default_model": "my-alias", "api_format": "openai_responses"},
+                ],
+                "api_key": "sk-x",
+            }
+        )
+        self._fetch_models_mock.return_value = {
+            "success": True,
+            "models": ["deepseek-v4-flash", "glm-5.2"],
+        }
+        self.assertTrue(providers.set_current_provider(pid, "codex")["success"])
+        with open(self._codex_config_path(), "r", encoding="utf-8") as f:
+            cfg = tomllib.loads(f.read())
+        self.assertEqual(cfg["model"], "my-alias")
+        with open(cfg["model_catalog_json"], "r", encoding="utf-8") as f:
+            catalog = json.load(f)
+        self.assertEqual([m["slug"] for m in catalog["models"]], ["my-alias", "deepseek-v4-flash", "glm-5.2"])
+
+    def test_codex_empty_model_auto_filled_and_catalog_written(self):
+        """默认模型为空时自动从端点拉取首个模型回填，并写 model_catalog_json 供模型选择器使用。"""
+        pid = db.add_provider(
+            {
+                "name": "TokenRhythm",
+                "apps": [
+                    {"app_type": "codex", "endpoint": "https://tokenrhythm.studio",
+                     "default_model": "", "api_format": "openai_chat"},
+                ],
+                "api_key": "sk-tr-123",
+            }
+        )
+        self._fetch_models_mock.return_value = {
+            "success": True,
+            "models": ["deepseek-v4-flash", "deepseek-v4-pro", "glm-5.2"],
+        }
+        self.assertTrue(providers.set_current_provider(pid, "codex")["success"])
+
+        with open(self._codex_config_path(), "r", encoding="utf-8") as f:
+            cfg = tomllib.loads(f.read())
+        self.assertEqual(cfg["model"], "deepseek-v4-flash")
+        self.assertIn("model_catalog_json", cfg)
+        self.assertTrue(os.path.exists(cfg["model_catalog_json"]))
+        with open(cfg["model_catalog_json"], "r", encoding="utf-8") as f:
+            catalog = json.load(f)
+        slugs = [m["slug"] for m in catalog["models"]]
+        self.assertEqual(slugs, ["deepseek-v4-flash", "deepseek-v4-pro", "glm-5.2"])
+
+        # 自动回填绑定模型，UI 可见
+        p = db.get_provider_by_id(pid)
+        codex_b = next(b for b in p["apps"] if b["app_type"] == "codex")
+        self.assertEqual(codex_b["default_model"], "deepseek-v4-flash")
+
+    def test_codex_relay_safety_settings_and_tool_mode(self):
+        """第三方中继兼容设置: base_url 补 /v1、关闭 multi_agent / apply_patch_freeform /
+        node_repl；catalog 条目用 direct 工具模式、无 custom apply_patch。"""
+        pid = db.add_provider(
+            {
+                "name": "Picpi",
+                "app_type": "codex",
+                "endpoint": "https://api.picpi.top",
+                "default_model": "gpt-5.6-sol",
+                "api_key": "sk-x",
+            }
+        )
+        self._fetch_models_mock.return_value = {
+            "success": True,
+            "models": ["deepseek-v4-flash", "glm-5.2"],
+        }
+        self.assertTrue(providers.set_current_provider(pid, "codex")["success"])
+        with open(self._codex_config_path(), "r", encoding="utf-8") as f:
+            cfg = tomllib.loads(f.read())
+        # multi-agent namespace / freeform apply_patch / node_repl namespace 都会
+        # 被第三方中继以 tool.namespace / tool.custom 拒绝,必须默认关闭
+        self.assertIs(cfg["features"]["multi_agent"], False)
+        self.assertIs(cfg["features"]["apply_patch_freeform"], False)
+        self.assertIs(cfg["mcp_servers"]["node_repl"]["enabled"], False)
+        self.assertEqual(cfg["model_providers"]["api_monitor"]["base_url"], "https://api.picpi.top/v1")
+        with open(cfg["model_catalog_json"], "r", encoding="utf-8") as f:
+            entry = json.load(f)["models"][0]
+        self.assertEqual(entry["tool_mode"], "direct")
+        self.assertIsNone(entry["apply_patch_tool_type"])
+        self.assertIsNone(entry["multi_agent_version"])
+        self.assertIs(entry["use_responses_lite"], False)
+        self.assertEqual(entry["web_search_tool_type"], "text_and_image")
+
+    def test_codex_empty_model_fetch_failure_returns_clear_error(self):
+        """默认模型为空且端点拿不到模型列表 → 明确报错，不写坏配置。"""
+        pid = db.add_provider(
+            {
+                "name": "NoModels",
+                "apps": [
+                    {"app_type": "codex", "endpoint": "https://nomodels.example/v1",
+                     "default_model": "", "api_format": "openai_responses"},
+                ],
+                "api_key": "sk-x",
+            }
+        )
+        self._fetch_models_mock.return_value = {
+            "success": False,
+            "error": "该端点不支持模型列表接口，请手动填写模型名称",
+        }
+        result = providers.set_current_provider(pid, "codex")
+        self.assertFalse(result["success"])
+        self.assertIn("填写默认模型", result["error"])
+        self.assertFalse(os.path.exists(self._codex_config_path()))
 
 
 if __name__ == "__main__":

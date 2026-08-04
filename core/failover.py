@@ -92,12 +92,16 @@ def confirm_pending(log_callback=None) -> dict:
     )
 
 
-def check_and_failover(failed_provider_id: int, log_callback=None) -> dict:
+def check_and_failover(failed_provider_id: int, app_type: Optional[str] = None, log_callback=None) -> dict:
     """
     检查是否需要 Failover，如果需要则执行切换
 
     Args:
         failed_provider_id: 测试失败的供应商 ID
+        app_type: 被测试的应用 'claude' | 'codex'。非空时只在该应用绑定
+                  role=当前 的情况下才触发切换（测试备用绑定不再误触发
+                  另一应用的切换）；为空或 'both' 时按旧逻辑（任一绑定
+                  为当前即视为当前）。
         log_callback: 日志回调 log_callback(level, text, name)
 
     Returns:
@@ -120,13 +124,21 @@ def check_and_failover(failed_provider_id: int, log_callback=None) -> dict:
     if not failed:
         return {"switched": False, "reason": "供应商不存在"}
 
-    # 仅当前供应商失败才切换（任一绑定为「当前」即视为当前）
-    if not _provider_is_current(failed):
+    # 'both' 无具体应用语义，按旧逻辑处理
+    if app_type == "both":
+        app_type = None
+
+    # 仅「当前」供应商失败才切换：传入 app_type 时只认该应用的绑定，
+    # 避免在 A 应用测试备用绑定失败时误触发 B 应用的切换
+    if app_type:
+        if not _is_current_for_app(failed, app_type):
+            return {"switched": False, "reason": "该应用下为非当前供应商，无需切换"}
+    elif not _provider_is_current(failed):
         return {"switched": False, "reason": "非当前供应商，无需切换"}
 
-    # 双端供应商: 取 role=当前 的绑定所在应用；否则主绑定 claude
-    failed_app = failed.get("app_type") or "claude"
-    if failed_app == "both":
+    # 失败应用：优先用传入的 app_type；否则双端供应商取 role=当前 的绑定
+    failed_app = app_type or (failed.get("app_type") or "claude")
+    if not app_type and failed_app == "both":
         failed_app = "claude"
         for b in failed.get("apps") or []:
             if b.get("role") == "当前":
@@ -263,6 +275,23 @@ def _provider_is_current(p: dict) -> bool:
         if b.get("role") == "当前":
             return True
     return False
+
+
+def _is_current_for_app(p: dict, app_type: str) -> bool:
+    """供应商在指定应用下是否当前。
+
+    优先按 apps 绑定判断；无绑定的旧数据回退到顶层 role/app_type。
+    """
+    apps = p.get("apps") or []
+    if apps:
+        for b in apps:
+            if b.get("app_type") == app_type and b.get("role") == "当前":
+                return True
+        return False
+    return p.get("role") == "当前" and (
+        (p.get("app_type") or "claude") == app_type
+        or (p.get("app_type") or "") == "both"
+    )
 
 
 def _matches_app(p: dict, app_type: Optional[str]) -> bool:

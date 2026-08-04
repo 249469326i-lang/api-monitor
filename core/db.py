@@ -322,6 +322,17 @@ def set_binding_role(provider_id: int, app_type: str, role: str = "当前") -> N
         _sync_provider_mirrors(cursor, provider_id)
 
 
+def update_binding_default_model(provider_id: int, app_type: str, default_model: str) -> None:
+    """更新指定应用绑定的默认模型，并同步 providers 镜像列。"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE provider_apps SET default_model=? WHERE provider_id=? AND app_type=?",
+            (default_model or "", provider_id, app_type),
+        )
+        _sync_provider_mirrors(cursor, provider_id)
+
+
 def mark_app_current(provider_id: int, app_type: str) -> None:
     """指定应用下：其余绑定置备用，目标绑定置当前；同步所有受影响供应商镜像。"""
     try:
@@ -719,7 +730,9 @@ DEFAULT_SETTINGS = {
     "webhook_events": "status_change,failover",  # Webhook 事件类型
     "history_retention_days": "30",   # 历史保留天数
     "test_concurrency": "3",          # 并发测试数
-    "test_timeout": "30",             # 超时时间(秒)
+    "test_timeout": "30",             # 请求读取超时时间(秒)
+    "test_connect_timeout": "5",      # TCP/TLS 建连超时(秒)
+    "test_max_duration": "60",        # 单供应商测试总时长上限(秒)
     "test_retries": "2",              # 重试次数
     "ssl_verify": "1",                # SSL 验证
     "auto_sync_claude_on_startup": "1",  # 启动时自动同步 Claude Code 当前配置为供应商 1=开启 0=关闭

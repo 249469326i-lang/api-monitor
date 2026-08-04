@@ -13,7 +13,7 @@
         @font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 600; font-display: swap; src: url('assets/fonts/ibm-plex-mono-600.woff2') format('woff2'); }
         @font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 700; font-display: swap; src: url('assets/fonts/ibm-plex-mono-700.woff2') format('woff2'); }
     </style>
-    <link rel="stylesheet" href="css/style.css?v=20260801-time-oneline">
+    <link rel="stylesheet" href="css/style.css?v=20260801-time-inline">
 </head>
 <body>
     <div class="app">
@@ -571,6 +571,14 @@
                     <div class="settings-row">
                         <label>TIMEOUT (S)</label>
                         <input type="number" id="setTimeout" min="5" max="120" value="30">
+                    </div>
+                    <div class="settings-row">
+                        <label>CONNECT TIMEOUT (S)</label>
+                        <input type="number" id="setConnectTimeout" min="1" max="30" value="5">
+                    </div>
+                    <div class="settings-row">
+                        <label>MAX DURATION (S)</label>
+                        <input type="number" id="setMaxDuration" min="10" max="300" value="60">
                     </div>
                     <div class="settings-row">
                         <label>RETRIES</label>

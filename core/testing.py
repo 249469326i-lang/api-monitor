@@ -13,6 +13,7 @@ import socket
 import time
 import threading
 import logging
+import http.client
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, Tuple
 from . import db
@@ -57,6 +58,73 @@ def _get_timeout() -> int:
         return int(_cached_setting("test_timeout") or "10")
     except (ValueError, TypeError):
         return 30
+
+
+def _get_connect_timeout() -> int:
+    """连接阶段超时（秒）：建立 TCP/TLS 连接的最长等待。
+
+    死端点（防火墙丢包/无监听）卡在 connect 阶段时，用短超时快速失败，
+    避免每个请求都白等完整的 test_timeout。"""
+    try:
+        return int(_cached_setting("test_connect_timeout") or "5")
+    except (ValueError, TypeError):
+        return 5
+
+
+def _get_max_duration() -> int:
+    """单供应商测试总时长上限（秒）：超出即中止后续重试，保证测试不会无限拖长。"""
+    try:
+        return int(_cached_setting("test_max_duration") or "60")
+    except (ValueError, TypeError):
+        return 60
+
+
+def _http_open(method: str, url: str, headers: Dict[str, str], body: Optional[bytes] = None,
+               connect_timeout: Optional[int] = None, read_timeout: Optional[int] = None,
+               _redirects: int = 0) -> Tuple[int, bytes]:
+    """HTTP 请求，连接与读取使用独立超时（秒）。
+
+    connect_timeout: TCP+TLS 建连超时（默认 test_connect_timeout）
+    read_timeout:   发完请求到读完响应体的超时（默认 test_timeout）
+    返回 (status, body_bytes)；网络层异常（timeout/拒绝/DNS 等）原样抛出，
+    由调用方经 _normalize_error_text/_classify_error 归一化。
+    """
+    if connect_timeout is None:
+        connect_timeout = _get_connect_timeout()
+    if read_timeout is None:
+        read_timeout = _get_timeout()
+
+    u = urllib.parse.urlparse(url)
+    ctx = _create_ssl_context()
+    if u.scheme == "https":
+        conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=connect_timeout, context=ctx)
+    else:
+        conn = http.client.HTTPConnection(u.hostname, u.port, timeout=connect_timeout)
+    try:
+        conn.connect()
+        if conn.sock is not None:
+            conn.sock.settimeout(read_timeout)
+        path = urllib.parse.urlunparse(("", "", u.path or "/", u.params, u.query, ""))
+        conn.request(method, path, body=body, headers=dict(headers))
+        resp = conn.getresponse()
+        data = resp.read()
+        status = resp.status
+
+        # 跟随重定向（与 urllib 默认行为一致），最多 5 跳
+        if status in (301, 302, 303, 307, 308):
+            loc = resp.getheader("Location")
+            if loc and _redirects < 5:
+                new_url = urllib.parse.urljoin(url, loc)
+                if status == 303:
+                    method, body = "GET", None
+                return _http_open(method, new_url, headers, body,
+                                  connect_timeout, read_timeout, _redirects + 1)
+        return status, data
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _get_retries() -> int:
@@ -349,17 +417,6 @@ def _build_error_detail(error: str, error_type: str = "") -> str:
     return raw
 
 
-def _read_http_error_body(exc: "urllib.error.HTTPError", limit: int = 800) -> str:
-    """安全读取 HTTPError 响应体（最多 limit 字符）"""
-    try:
-        raw = exc.read()
-        if not raw:
-            return ""
-        return raw.decode("utf-8", errors="replace")[:limit]
-    except Exception:
-        return ""
-
-
 def _extract_api_error_message(body_text: str) -> str:
     """从 API 错误响应 JSON/文本中提取可读 message。"""
     if not body_text:
@@ -537,8 +594,61 @@ API_FORMAT_LABELS = {
     "gemini_native": "Gemini generateContent",
 }
 
+# Agent → 实际协议映射（Agent 实际发送的请求协议）
+_AGENT_PRIMARY_PROTOCOL = {
+    "claude": "anthropic_messages",   # Claude Code → POST /messages
+    "codex": "openai_responses",      # Codex/ChatGPT 桌面版 → POST /responses
+    "hermes": "openai_chat",          # Hermes → POST /chat/completions
+    "gemini": "gemini_native",        # Gemini → generateContent
+}
 
-def test_provider(provider_id: int, mode: str = "fast", log_callback=None) -> Dict[str, any]:
+# Agent 实际协议失败时的错误消息
+_AGENT_PROTOCOL_FAIL_MESSAGES = {
+    "claude": "该供应商不支持 Anthropic Messages API（POST /messages），无法用于 Claude Code",
+    "codex": "该供应商不支持 OpenAI Responses API（POST /responses），无法用于 Codex/ChatGPT 桌面版",
+    "hermes": "该供应商不支持 OpenAI Chat Completions API，无法用于 Hermes",
+    "gemini": "该供应商不支持 Gemini generateContent API，无法用于 Gemini",
+}
+
+_ALL_FORMATS = ["anthropic_messages", "openai_chat", "openai_responses", "gemini_native"]
+
+
+def _agent_protocol_order(app_type: str, api_format: str = "") -> list:
+    """返回测试格式优先级列表。
+    目标 Agent 的实际协议始终排在首位（强制验证）；
+    api_format 仅作为备选参考，不影响排序。
+    对于 app_type='both'，claude 和 codex 的实际协议都在前两位。
+    """
+    if app_type == "both":
+        # Claude + Codex: 两个 Agent 的实际协议都排在前两位
+        order = ["anthropic_messages", "openai_responses"]
+        for fmt in _ALL_FORMATS:
+            if fmt not in order:
+                order.append(fmt)
+        return order
+
+    # 单一 Agent：Agent 实际协议排首位
+    primary = _AGENT_PRIMARY_PROTOCOL.get(app_type, "anthropic_messages")
+    order = [primary]
+    for fmt in _ALL_FORMATS:
+        if fmt not in order:
+            order.append(fmt)
+    return order
+
+
+def _agent_required_protocols(app_type: str) -> list:
+    """返回该 Agent 真实运行所需的协议列表（全部必须验证成功，缺一即失败）。
+    - claude → anthropic_messages（Claude Code 只发 POST /messages）
+    - codex → openai_responses（Codex 只发 POST /responses）
+    - both → 两者都必须成功，才能同时用于两个 Agent
+    - hermes / gemini → 各自实际协议
+    """
+    if app_type == "both":
+        return ["anthropic_messages", "openai_responses"]
+    return [_AGENT_PRIMARY_PROTOCOL.get(app_type, "anthropic_messages")]
+
+
+def test_provider(provider_id: int, mode: str = "fast", log_callback=None, app_type: Optional[str] = None) -> Dict[str, any]:
     """
     测试单个供应商
 
@@ -546,6 +656,8 @@ def test_provider(provider_id: int, mode: str = "fast", log_callback=None) -> Di
         provider_id: 供应商 ID
         mode: 测试模式 - fast(快速) / full(完整)
         log_callback: CLI 日志回调 log_callback(level, text)
+        app_type: 应用类型 'claude' | 'codex'，指定时只测试该应用对应的绑定；
+                  不指定则沿用供应商顶层 app_type（兼容旧数据）
 
     Returns:
         测试结果字典
@@ -554,18 +666,33 @@ def test_provider(provider_id: int, mode: str = "fast", log_callback=None) -> Di
     if not provider:
         return {"success": False, "error": "供应商不存在"}
 
+    # 确定目标应用：优先使用调用方传入的 app_type，否则回退供应商顶层设置
+    if app_type:
+        app_type = (str(app_type).strip().lower() or "claude")
+    else:
+        app_type = (provider.get("app_type") or "claude").strip() or "claude"
+
     endpoint = provider.get("endpoint", "")
     api_key = provider.get("api_key", "")
     name = provider.get("name", "")
     default_model = (provider.get("default_model") or "").strip()
-    app_type = (provider.get("app_type") or "claude").strip()
     api_format = (provider.get("api_format") or "").strip()
 
-    # 从 apps 绑定中读取推理强度和上下文长度
+    # 从 apps 绑定中读取与目标应用匹配的配置；
+    # 存在匹配绑定时优先使用绑定上的模型/格式，缺失字段回退到顶层
     reasoning_effort = ""
     context_length = 0
     for b in (provider.get("apps") or []):
         if b.get("app_type") == app_type:
+            b_model = (b.get("default_model") or "").strip()
+            b_format = (b.get("api_format") or "").strip()
+            b_endpoint = (b.get("endpoint") or "").strip()
+            if b_model:
+                default_model = b_model
+            if b_format:
+                api_format = b_format
+            if b_endpoint:
+                endpoint = b_endpoint
             reasoning_effort = (b.get("reasoning_effort") or "").strip()
             context_length = b.get("context_length") or 0
             break
@@ -585,11 +712,18 @@ def test_provider(provider_id: int, mode: str = "fast", log_callback=None) -> Di
 
     # 重试逻辑：指数退避
     max_retries = _get_retries()
+    max_duration = _get_max_duration()
+    deadline = time.monotonic() + max_duration
     last_result = None
 
-    start_time = time.time()
-
     for attempt in range(max_retries + 1):
+        # 总时长上限：超出即中止，保证测试不会无限拖长
+        if time.monotonic() > deadline:
+            log("warn", f"⏱ 测试超过最大时长 {max_duration}s，已中止")
+            if last_result is None:
+                last_result = {"success": False, "error": f"测试超过最大时长 {max_duration}s，已中止"}
+            break
+
         if attempt > 0:
             wait = 1.0 * (2 ** (attempt - 1))  # 1s, 2s, 4s...
             log("info", f"↻ 第 {attempt + 1} 次尝试 (等待 {wait}s)")
@@ -607,7 +741,7 @@ def test_provider(provider_id: int, mode: str = "fast", log_callback=None) -> Di
             else:
                 # 完整测试：发送测试消息并验证 AI 回复
                 log("info", f"→ POST {endpoint} | model={default_model or '默认'} | effort={reasoning_effort or '默认'} | ctx={context_length or '默认'}")
-                result = _test_chat_endpoint(endpoint, api_key, default_model, app_type, api_format, reasoning_effort=reasoning_effort, context_length=context_length)
+                result = _test_chat_endpoint(endpoint, api_key, default_model, app_type, api_format, reasoning_effort=reasoning_effort, context_length=context_length, deadline=deadline)
 
             last_result = result
 
@@ -623,13 +757,15 @@ def test_provider(provider_id: int, mode: str = "fast", log_callback=None) -> Di
             if error_type in (
                 "auth_error", "rate_limited", "quota_error",
                 "dns_failure", "connection_refused", "network_unreachable",
+                "timeout", "ssl_error",
             ):
                 break
 
         except Exception as e:
             last_result = {"success": False, "error": _normalize_error_text(e) or str(e)}
             error_type = _classify_error(last_result["error"])
-            if error_type in ("auth_error", "rate_limited", "dns_failure", "quota_error"):
+            if error_type in ("auth_error", "rate_limited", "dns_failure", "quota_error",
+                              "timeout", "ssl_error", "connection_refused", "network_unreachable"):
                 break
 
     latency = int((time.time() - start_time) * 1000)
@@ -643,7 +779,7 @@ def test_provider(provider_id: int, mode: str = "fast", log_callback=None) -> Di
 
         # 快速测试成功后，如果 api_format 未知，做轻量探测
         if mode == "fast" and not api_format:
-            probed = _probe_api_format(endpoint, api_key, default_model, app_type)
+            probed, _ = _probe_api_format(endpoint, api_key, default_model, app_type)
             if probed:
                 api_format = probed
 
@@ -719,10 +855,12 @@ def test_provider(provider_id: int, mode: str = "fast", log_callback=None) -> Di
         }
 
 
-def _probe_api_format(endpoint: str, api_key: str, model: str = "", app_type: str = "claude") -> str:
-    """轻量级 API 格式探测（用于快速测试后）
+def _probe_api_format(endpoint: str, api_key: str, model: str = "", app_type: str = "claude") -> Tuple[str, str]:
+    """轻量级 API 格式探测（用于快速测试后 / 完整测试前的快速失败）
     对每种格式的端点发送极短超时的 POST，只要有响应（含错误码）即认为该格式存在。
-    返回格式标识字符串或空字符串。
+    返回 (格式标识, 失败原因)：格式非空表示探测成功；否则第二个元素为失败原因
+    （dns_failure / connection_refused / network_unreachable / ssl_error /
+    timeout / no_match）。
     """
     # 5 秒超时，避免探测拖慢快速测试
     probe_timeout = 5
@@ -763,13 +901,17 @@ def _probe_api_format(endpoint: str, api_key: str, model: str = "", app_type: st
                    {"contents": [{"parts": [{"text": "."}]}]},
                    {"Content-Type": "application/json"}))
 
-    # 按 app_type 调整探测顺序
+    # 按 app_type 调整探测顺序：Agent 实际协议优先
     if app_type == "gemini":
         probes.sort(key=lambda x: 0 if x[0] == "gemini_native" else 1)
-    elif app_type in ("hermes", "codex"):
-        probes.sort(key=lambda x: 0 if x[0] in ("openai_chat", "openai_responses") else 1)
+    elif app_type == "codex":
+        # Codex 桌面版只支持 Responses API → 优先探测 openai_responses
+        probes.sort(key=lambda x: 0 if x[0] == "openai_responses" else (1 if x[0] == "openai_chat" else 2))
+    elif app_type == "hermes":
+        probes.sort(key=lambda x: 0 if x[0] == "openai_chat" else 1)
+    elif app_type == "claude":
+        probes.sort(key=lambda x: 0 if x[0] == "anthropic_messages" else 1)
 
-    ctx = _create_ssl_context()
     base_header_variants = [{"User-Agent": _USER_AGENT}]
     if api_key:
         base_header_variants = [
@@ -777,8 +919,16 @@ def _probe_api_format(endpoint: str, api_key: str, model: str = "", app_type: st
             {"User-Agent": _USER_AGENT, "x-api-key": api_key},
         ]
 
+    # 死端点短路：DNS/拒绝/不可达 → 直接返回；
+    # 连续 2 次超时同样视为端点不可达，避免逐个格式 × 认证 × 路径耗满超时
+    _fatal = {"dead": False, "timeouts": 0}
+
     for fmt_key, paths, body, extra_headers in probes:
+        if _fatal["dead"]:
+            break
         for headers_base in base_header_variants:
+            if _fatal["dead"]:
+                break
             headers = dict(headers_base)
             headers.update(extra_headers)
             # Gemini 认证只走 x-goog-api-key 头，不把 Key 拼进 URL
@@ -787,24 +937,38 @@ def _probe_api_format(endpoint: str, api_key: str, model: str = "", app_type: st
                 headers["x-goog-api-key"] = api_key
 
             for url in paths:
+                if _fatal["dead"]:
+                    break
                 try:
                     data = json.dumps(body).encode("utf-8")
-                    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-                    with urllib.request.urlopen(req, timeout=probe_timeout, context=ctx) as resp:
-                        if resp.status in (200, 201):
-                            return fmt_key
-                except urllib.error.HTTPError as e:
+                    status, _ = _http_open("POST", url, headers, data,
+                                           connect_timeout=probe_timeout,
+                                           read_timeout=probe_timeout)
+                    if status in (200, 201):
+                        return fmt_key, ""
                     # 400/401/403/422/429 都说明端点存在且接受该格式
-                    if e.code in (400, 401, 403, 404, 405, 422, 429):
-                        # 404 说明路径不存在，跳过
-                        if e.code == 404:
+                    if status in (400, 401, 403, 405, 422, 429):
+                        if status == 404:
                             continue
-                        return fmt_key
-                except (urllib.error.URLError, Exception):
-                    # DNS 失败/超时 → 该端点不可达，跳过
-                    continue
+                        return fmt_key, ""
+                except Exception as e:
+                    err_text = _normalize_error_text(e) or str(e)
+                    etype = _classify_error(err_text)
+                    # SSL 握手「超时」本质是端点无响应，按 timeout 处理
+                    if etype == "ssl_error" and ("timed out" in err_text.lower() or "timeout" in err_text.lower()):
+                        etype = "timeout"
+                    if etype in ("dns_failure", "connection_refused", "network_unreachable"):
+                        # 整个 host 不可达，再探测也没有意义
+                        return "", etype
+                    if etype == "timeout":
+                        _fatal["timeouts"] += 1
+                        if _fatal["timeouts"] >= 2:
+                            return "", "timeout"
+                    elif etype == "ssl_error":
+                        return "", "ssl_error"
+                    # 其它错误（如连接重置）继续尝试其它路径/认证
 
-    return ""
+    return "", "no_match"
 
 
 def _test_models_endpoint(endpoint: str, api_key: str) -> Dict[str, any]:
@@ -829,8 +993,6 @@ def _test_models_endpoint(endpoint: str, api_key: str) -> Dict[str, any]:
     else:
         auth_list.append(("none", {}))
 
-    ctx = _create_ssl_context()
-    timeout = _get_timeout()
     all_404 = True
     last_error = ""
     attempt_errors = []
@@ -850,44 +1012,34 @@ def _test_models_endpoint(endpoint: str, api_key: str) -> Dict[str, any]:
         headers.update(auth_h)
 
         for url in paths:
-            req = urllib.request.Request(url, headers=headers, method="GET")
             try:
-                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as response:
-                    body = response.read().decode("utf-8", errors="replace")
-                    if response.status == 200:
-                        # 200 不代表可用:Cloudflare 挑战页/登录页也返回 200。
-                        # 必须能解析出 JSON 才判定正常，否则按无效响应处理
-                        try:
-                            parsed = json.loads(body)
-                            if isinstance(parsed, (dict, list)):
-                                return {"success": True, "detail": "正常"}
-                        except (ValueError, TypeError):
-                            pass
-                        err = "响应非 JSON（可能是网页/挑战页）"
-                        last_error = err
-                        attempt_errors.append(f"[{_label(url, auth_name)}] {err}")
-                        all_404 = False
-                        continue
-                    err = _format_http_error(response.status, body[:800])
-                    last_error = err
-                    attempt_errors.append(f"[{_label(url, auth_name)}] {err}")
-                    all_404 = False
-            except urllib.error.HTTPError as e:
-                body = _read_http_error_body(e)
-                err = _format_http_error(e.code, body)
-                if e.code != 404:
-                    all_404 = False
-                    # 认证/限流类错误：直接返回，避免被后续 404 覆盖
-                    if e.code in (401, 403, 429):
-                        return {"success": False, "error": f"[{_label(url, auth_name)}] {err}"}
-                last_error = err
-                attempt_errors.append(f"[{_label(url, auth_name)}] {err}")
-            except urllib.error.URLError as e:
-                err = _normalize_error_text(e.reason if e.reason is not None else e) or str(e.reason)
-                return {"success": False, "error": f"[{_label(url, auth_name)}] {err}"}
+                status, body_bytes = _http_open("GET", url, headers)
             except Exception as e:
                 err = _normalize_error_text(e) or str(e)
                 return {"success": False, "error": f"[{_label(url, auth_name)}] {err}"}
+            body = body_bytes.decode("utf-8", errors="replace")
+            if status == 200:
+                # 200 不代表可用:Cloudflare 挑战页/登录页也返回 200。
+                # 必须能解析出 JSON 才判定正常，否则按无效响应处理
+                try:
+                    parsed = json.loads(body)
+                    if isinstance(parsed, (dict, list)):
+                        return {"success": True, "detail": "正常"}
+                except (ValueError, TypeError):
+                    pass
+                err = "响应非 JSON（可能是网页/挑战页）"
+                last_error = err
+                attempt_errors.append(f"[{_label(url, auth_name)}] {err}")
+                all_404 = False
+                continue
+            err = _format_http_error(status, body[:800])
+            if status != 404:
+                all_404 = False
+                # 认证/限流类错误：直接返回，避免被后续 404 覆盖
+                if status in (401, 403, 429):
+                    return {"success": False, "error": f"[{_label(url, auth_name)}] {err}"}
+            last_error = err
+            attempt_errors.append(f"[{_label(url, auth_name)}] {err}")
 
     # 所有路径都 404 → 该提供商不支持 /models，用 HEAD 请求做纯连通性检测
     if all_404:
@@ -902,58 +1054,86 @@ def _test_models_endpoint(endpoint: str, api_key: str) -> Dict[str, any]:
 
 def _test_connectivity_fallback(endpoint: str, api_key: str) -> Dict[str, any]:
     """当 /models 全部 404 时，对端点根路径做 HEAD 请求检测连通性"""
-    ctx = _create_ssl_context()
-    timeout = _get_timeout()
-
     headers = {"User-Agent": _USER_AGENT}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        req = urllib.request.Request(endpoint, headers=headers, method="HEAD")
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as response:
-            return {"success": True, "detail": "端点可达(无 /models)"}
-    except urllib.error.HTTPError as e:
-        # 4xx/5xx 都说明服务器可达，只是不接受 HEAD
-        if 400 <= e.code < 600:
-            # 若是明确鉴权失败，仍返回错误信息
-            if e.code in (401, 403):
-                body = _read_http_error_body(e)
-                return {"success": False, "error": _format_http_error(e.code, body)}
-            return {"success": True, "detail": "端点可达(无 /models)"}
-        body = _read_http_error_body(e)
-        return {"success": False, "error": _format_http_error(e.code, body)}
-    except urllib.error.URLError as e:
-        return {"success": False, "error": _normalize_error_text(e.reason if e.reason is not None else e) or str(e.reason)}
+        status, body_bytes = _http_open("HEAD", endpoint, headers)
     except Exception as e:
         return {"success": False, "error": _normalize_error_text(e) or str(e)}
 
+    if 400 <= status < 600:
+        # 4xx/5xx 都说明服务器可达，只是不接受 HEAD
+        if status in (401, 403):
+            body = body_bytes.decode("utf-8", errors="replace")
+            return {"success": False, "error": _format_http_error(status, body)}
+        return {"success": True, "detail": "端点可达(无 /models)"}
+    return {"success": True, "detail": "端点可达(无 /models)"}
 
-def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: str = "claude", api_format: str = "", reasoning_effort: str = "", context_length: int = 0) -> Dict[str, any]:
+
+def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: str = "claude", api_format: str = "", reasoning_effort: str = "", context_length: int = 0, deadline: Optional[float] = None) -> Dict[str, any]:
     """测试聊天端点（完整测试）
-    手动指定 api_format 时优先尝试该格式；否则按 app_type 优先级依次尝试:
-      - claude: Anthropic Messages → OpenAI Chat Completions → OpenAI Responses → Gemini
-      - hermes/codex: OpenAI Chat Completions → OpenAI Responses → Anthropic Messages → Gemini
-      - gemini: Gemini → OpenAI Chat Completions → OpenAI Responses → Anthropic Messages
-    返回结果含 api_format 字段标识命中的格式。
+    配置了 api_format 时只定向测试该格式（当前选择的模型 + 推理强度 + 上下文长度），
+    不再探测/扫描其它协议，保证测试快速完成。
+    未配置 api_format 时按 Agent 真实协议强制验证：
+      - claude: 必须 Anthropic Messages 成功（否则真实 Claude Code 报错）
+      - codex: 必须 OpenAI Responses 成功（否则真实 Codex 报错）
+      - both: 两者都必须成功
+      - hermes / gemini: 各自实际协议优先
+    返回结果含 api_format 标识命中的格式、tested_format 标识实际验证的协议。
+
+    deadline: 绝对时间戳（time.monotonic 基准），超时后不再发起新请求。
+              用于约束慢端点上「每个请求 20-30s 慢错误、却不算超时」的
+              全格式 × 路径 × 认证扫描，避免单供应商测试拖到数分钟。
     """
 
     if not (api_key or "").strip():
         # 缺 key 时不要误报「格式不匹配」
         return {"success": False, "error": "未配置 API Key"}
 
+    # 已配置 API 格式时跳过探测，直接定向测试该格式（当前模型 + 推理强度 + 上下文长度）；
+    # 未配置时才做轻量探测（单请求 5s 超时，死端点 2 次超时即停）：
+    # 端点无响应/不可达时快速失败，避免后续全格式 × 路径 × 认证
+    # 的完整请求在慢端点（如 60s+ 才回包的中继）上逐个耗满 test_timeout。
+    if api_format in _ALL_FORMATS:
+        probed_fmt, probe_reason = api_format, ""
+    else:
+        probed_fmt, probe_reason = _probe_api_format(endpoint, api_key, model, app_type)
+    if not probed_fmt:
+        reason_map = {
+            "dns_failure": "域名无法解析",
+            "connection_refused": "连接被拒绝",
+            "network_unreachable": "网络不可达",
+            "ssl_error": "SSL/TLS 握手失败",
+            "timeout": "端点无响应（5s 快速探测连续超时）",
+            "no_match": "所有 API 格式均无法匹配（快速探测）",
+        }
+        reason = reason_map.get(probe_reason, "端点无响应")
+        return {
+            "success": False,
+            "error": f"{reason}，请检查端点/网络配置",
+            "probe_failed": True,
+        }
+
     auth_methods = []
     auth_methods.append(("Bearer", {"Authorization": f"Bearer {api_key}"}))
     auth_methods.append(("x-api-key", {"x-api-key": api_key}))
 
     _effort = reasoning_effort.strip() if reasoning_effort else ""
-    _max_tokens = 256
+    # 上下文长度作为请求的 max_tokens/max_output_tokens 上限：
+    # 验证当前配置的上下文长度确实被模型/端点接受
+    _ctx = int(context_length or 0)
+    _max_tokens = _ctx if _ctx > 0 else 256
 
     attempt_errors = []
     # 死端点短路：DNS 解析失败/连接拒绝/网络不可达意味着同一 host 的
     # 所有格式×路径×认证组合都会失败，没必要按 30s 超时逐个耗完。
     # 连续超时 2 次同样视为端点不可用。
     _fatal = {"dead": False, "timeouts": 0}
+
+    _mono_deadline = deadline
+    _expired = lambda: _mono_deadline is not None and time.monotonic() > _mono_deadline
 
     def _record_error(label: str, result: dict):
         err = (result or {}).get("error") or ""
@@ -998,7 +1178,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
                 body["reasoning_effort"] = _effort
             for path in paths:
                 for auth_name, auth_h in auth_methods:
-                    if _fatal["dead"]:
+                    if _fatal["dead"] or _expired():
                         return None
                     url = f"{endpoint}/{path}"
                     headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
@@ -1013,6 +1193,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
                                     "detail": f"AI 正常回复 ({auth_name} | model={claude_model}" + (f" | effort={_effort}" if _effort else "") + ")",
                                     "response_snippet": snippet,
                                     "api_format": "anthropic_messages",
+                                    "tested_path": url,
                                 }
                             _record_error(f"anthropic/{path}/{auth_name}/{claude_model}", result)
                         else:
@@ -1041,7 +1222,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
                 stripped_base = f"{parsed.scheme}://{parsed.netloc}{stripped_path}".rstrip("/")
                 urls.append(f"{stripped_base}/v1/chat/completions")
         for url in urls:
-            if _fatal["dead"]:
+            if _fatal["dead"] or _expired():
                 return None
             headers = {"Content-Type": "application/json"}
             if api_key:
@@ -1052,7 +1233,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
                 if result["success"]:
                     snippet = _extract_response_snippet(result.get("body"), "auto")
                     if snippet:
-                        return {"success": True, "detail": f"AI 正常回复 (OpenAI | model={oai_model}" + (f" | effort={_effort}" if _effort else "") + ")", "response_snippet": snippet, "api_format": "openai_chat"}
+                        return {"success": True, "detail": f"AI 正常回复 (OpenAI | model={oai_model}" + (f" | effort={_effort}" if _effort else "") + ")", "response_snippet": snippet, "api_format": "openai_chat", "tested_path": url}
                     _record_error(f"openai_chat{path_tail}/{oai_model}", result)
                 else:
                     _record_error(f"openai_chat{path_tail}/{oai_model}", result)
@@ -1065,11 +1246,13 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
         body = {"model": oai_model, "input": "你是谁呀，小朋友"}
         if _effort:
             body["reasoning_effort"] = _effort
+        if _ctx > 0:
+            body["max_output_tokens"] = _ctx
         paths = ["responses"]
         if not endpoint.endswith("/v1"):
             paths.append("v1/responses")
         for path in paths:
-            if _fatal["dead"]:
+            if _fatal["dead"] or _expired():
                 return None
             url = f"{endpoint}/{path}"
             headers = {"Content-Type": "application/json"}
@@ -1080,7 +1263,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
                 if result["success"]:
                     snippet = _extract_response_snippet(result.get("body"), "auto")
                     if snippet:
-                        return {"success": True, "detail": f"AI 正常回复 (Responses | model={oai_model}" + (f" | effort={_effort}" if _effort else "") + ")", "response_snippet": snippet, "api_format": "openai_responses"}
+                        return {"success": True, "detail": f"AI 正常回复 (Responses | model={oai_model}" + (f" | effort={_effort}" if _effort else "") + ")", "response_snippet": snippet, "api_format": "openai_responses", "tested_path": url}
                     _record_error(f"openai_responses/{path}/{oai_model}", result)
                 else:
                     _record_error(f"openai_responses/{path}/{oai_model}", result)
@@ -1091,9 +1274,11 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
     def _try_gemini():
         gemini_model = model if model else "gemini-2.0-flash"
         body = {"contents": [{"parts": [{"text": "你是谁呀，小朋友"}]}]}
+        if _ctx > 0:
+            body["generationConfig"] = {"maxOutputTokens": _ctx}
         model_names = [gemini_model] if model else ["gemini-2.0-flash", "gemini-1.5-flash"]
         for m in model_names:
-            if _fatal["dead"]:
+            if _fatal["dead"] or _expired():
                 return None
             url = f"{endpoint}/models/{m}:generateContent"
             headers = {"Content-Type": "application/json"}
@@ -1105,7 +1290,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
                 if result["success"]:
                     snippet = _extract_response_snippet(result.get("body"), "auto")
                     if snippet:
-                        return {"success": True, "detail": "AI 正常回复 (Gemini)", "response_snippet": snippet, "api_format": "gemini_native"}
+                        return {"success": True, "detail": "AI 正常回复 (Gemini)", "response_snippet": snippet, "api_format": "gemini_native", "tested_path": url}
                     _record_error(f"gemini/models/{m}:generateContent", result)
                 else:
                     _record_error(f"gemini/models/{m}:generateContent", result)
@@ -1120,25 +1305,78 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
         "gemini_native": _try_gemini,
     }
 
-    if app_type == "gemini":
-        order = ["gemini_native", "openai_chat", "openai_responses", "anthropic_messages"]
-    elif app_type in ("hermes", "codex"):
-        order = ["openai_chat", "openai_responses", "anthropic_messages", "gemini_native"]
-    else:
-        order = ["anthropic_messages", "openai_chat", "openai_responses", "gemini_native"]
-
+    # 已配置 API 格式 → 定向测试：只验证该格式（当前选择的模型 + 推理强度 + 上下文长度），
+    # 不再探测/扫描其它协议，单供应商测试从几十个请求降到 1~2 个请求
     if api_format in format_funcs:
-        # 用户已指定 API 格式，只尝试该格式，不轮询其他格式（避免超长等待）
-        order = [api_format]
+        result = format_funcs[api_format]()
+        if result:
+            r = dict(result)
+            r["tested_format"] = api_format
+            if "tested_path" not in r:
+                r["tested_path"] = ""
+            return r
+        detail = _summarize_attempt_errors(attempt_errors)
+        if detail and detail != "所有 API 格式均无法匹配":
+            return {"success": False, "error": detail}
+        return {"success": False, "error": "所有 API 格式均无法匹配（无具体上游错误，请检查端点/密钥/模型）"}
 
+    # 测试顺序：Agent 实际协议排首位；同时强制验证该 Agent 真实所需协议，
+    # 避免出现「CLI 测试通过、真实 Claude Code/Codex 却报错」的偏差
+    required = _agent_required_protocols(app_type)
+    order = _agent_protocol_order(app_type, api_format)
+
+    results = {}
     for fmt_key in order:
-        if _fatal["dead"]:
+        if _fatal["dead"] or _expired():
             break
+        if fmt_key in results:
+            continue
         result = format_funcs[fmt_key]()
         if result:
-            return result
+            results[fmt_key] = result
+            # 该 Agent 所需的全部协议都验证成功 → 真实启动可用，返回成功
+            if all(f in results for f in required):
+                r = dict(result)
+                r["tested_format"] = "+".join(required)
+                if "tested_path" not in r:
+                    r["tested_path"] = ""
+                return r
 
-    # 把真实上游错误带到外层，而不是只剩“所有 API 格式均无法匹配”
+    # Agent 实际协议验证失败（即使其它协议可用）→ 与真实启动行为保持一致,判定失败
+    missing = [f for f in required if f not in results]
+    if missing:
+        label_map = {
+            "anthropic_messages": "Anthropic Messages API（POST /messages）",
+            "openai_responses": "OpenAI Responses API（POST /responses）",
+            "openai_chat": "OpenAI Chat Completions API（POST /chat/completions）",
+            "gemini_native": "Gemini generateContent API",
+        }
+        agent_name = {
+            "claude": "Claude Code",
+            "codex": "Codex/ChatGPT 桌面版",
+            "hermes": "Hermes",
+            "gemini": "Gemini",
+        }.get(app_type, app_type)
+        if app_type == "both":
+            parts = []
+            if "anthropic_messages" in missing:
+                parts.append("Claude Code 协议（Anthropic Messages / POST /messages）不可用")
+            if "openai_responses" in missing:
+                parts.append("Codex 协议（OpenAI Responses / POST /responses）不可用")
+            error = "；".join(parts) + "，无法同时用于 Claude Code 与 Codex"
+        else:
+            error = f"该供应商不支持 {label_map[missing[0]]}，无法用于 {agent_name}"
+        if results:
+            hit = "、".join(label_map[f] for f in results)
+            error += f"（检测到 {hit} 可用，但 {agent_name} 不使用该协议）"
+        if _expired():
+            error += "（已达到测试时长上限，已中止）"
+        detail = _summarize_attempt_errors(attempt_errors)
+        if detail and detail != "所有 API 格式均无法匹配":
+            error += f" | {detail}"
+        return {"success": False, "error": error}
+
+    # 所有格式都没成功（含必测协议），把真实上游错误带到外层
     detail = _summarize_attempt_errors(attempt_errors)
     if detail and detail != "所有 API 格式均无法匹配":
         return {"success": False, "error": detail}
@@ -1242,15 +1480,18 @@ def _extract_response_snippet(body_str: str, style: str) -> str:
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
-def fetch_models(endpoint: str, api_key: str, api_format: str = "", default_model: str = "") -> Dict[str, any]:
+def fetch_models(endpoint: str, api_key: str, api_format: str = "", default_model: str = "",
+                 responses_only: bool = False) -> Dict[str, any]:
     """从提供商的 /models 端点获取可用模型列表
-    尝试多种路径和认证方式,兼容 OpenAI / Anthropic / 各种中继代理"""
+    尝试多种路径和认证方式,兼容 OpenAI / Anthropic / 各种中继代理。
+
+    responses_only=True 时，若响应中带 supports_responses 能力字段则只保留
+    支持 Responses API 的模型（Codex 自 2026-02 起仅支持 responses wire）；
+    能力字段缺失的中继保持全部返回，不做过滤。
+    """
 
     if not endpoint:
         return {"success": False, "error": "未提供端点 URL"}
-
-    ctx = _create_ssl_context()
-    timeout = _get_timeout()
 
     # 构建路径变体（覆盖更多中继代理的路由格式）
     base = endpoint.rstrip("/")
@@ -1298,6 +1539,7 @@ def fetch_models(endpoint: str, api_key: str, api_format: str = "", default_mode
 
     collected_models = []
     seen_models = set()
+    collected_caps: dict = {}
 
     def add_models(items):
         for model in items:
@@ -1321,53 +1563,65 @@ def fetch_models(endpoint: str, api_key: str, api_format: str = "", default_mode
                         parsed_url.scheme, parsed_url.netloc, parsed_url.path,
                         parsed_url.params, urllib.parse.urlencode(qs, doseq=True), parsed_url.fragment
                     ))
-            req = urllib.request.Request(request_url, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-                if resp.status != 200:
-                    return None, f"HTTP {resp.status}"
-                body = resp.read().decode("utf-8", errors="replace")
-                try:
-                    data = json.loads(body)
-                except json.JSONDecodeError:
-                    return None, f"响应非 JSON（HTTP 200，可能是 HTML 页面）"
-                models = _extract_model_ids(data)
-                # 检查分页 (OpenAI 格式: data => has_more + first_id/last_id ; after cursor 传参翻页)
-                next_url = None
-                if isinstance(data, dict):
-                    # OpenAI /v1/models 标准分页: data + has_more + first_id + last_id + object == "list"
-                    if data.get("has_more") is True and data.get("object") == "list" and data.get("first_id") and data.get("last_id"):
-                        next_cursor = data.get("last_id")
-                        if next_cursor:
-                            # 构造翻页 URL（保留查询参数）
-                            from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-                            parsed = urlparse(url)
-                            qs = parse_qs(parsed.query)
-                            qs["after"] = [str(next_cursor)]
-                            new_qs = urlencode(qs, doseq=True)
-                            next_url = urlunparse((
-                                parsed.scheme, parsed.netloc, parsed.path,
-                                parsed.params, new_qs, parsed.fragment
-                            ))
-                return {"models": models, "next_url": next_url}, None
-        except urllib.error.HTTPError as e:
-            body = _read_http_error_body(e)
-            return None, _format_http_error(e.code, body)
-        except urllib.error.URLError as e:
-            return None, _normalize_error_text(e.reason if e.reason is not None else e) or str(e.reason)
+            status, body_bytes = _http_open("GET", request_url, headers,
+                                            read_timeout=min(_get_timeout(), 15))
+            if status != 200:
+                return None, _format_http_error(status, body_bytes.decode("utf-8", errors="replace"))
+            body = body_bytes.decode("utf-8", errors="replace")
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                return None, f"响应非 JSON（HTTP 200，可能是 HTML 页面）"
+            models = _extract_model_ids(data)
+            caps = _extract_responses_capabilities(data)
+            # 检查分页 (OpenAI 格式: data => has_more + first_id + last_id ; after cursor 传参翻页)
+            next_url = None
+            if isinstance(data, dict):
+                # OpenAI /v1/models 标准分页: data + has_more + first_id + last_id + object == "list"
+                if data.get("has_more") is True and data.get("object") == "list" and data.get("first_id") and data.get("last_id"):
+                    next_cursor = data.get("last_id")
+                    if next_cursor:
+                        # 构造翻页 URL（保留查询参数）
+                        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+                        parsed = urlparse(url)
+                        qs = parse_qs(parsed.query)
+                        qs["after"] = [str(next_cursor)]
+                        new_qs = urlencode(qs, doseq=True)
+                        next_url = urlunparse((
+                            parsed.scheme, parsed.netloc, parsed.path,
+                            parsed.params, new_qs, parsed.fragment
+                        ))
+            return {"models": models, "next_url": next_url, "caps": caps}, None
         except Exception as e:
             return None, _normalize_error_text(e) or str(e)
 
+    # 死端点短路：DNS/拒绝/SSL 直接结束；连续 2 次超时同样视为端点不可达
+    _fatal = {"dead": False, "timeouts": 0}
+
     for auth_h in auth_headers_list:
+        if _fatal["dead"]:
+            break
         headers = {"User-Agent": _USER_AGENT}
         headers.update(auth_h)
         auth_failed = False
 
         for url in paths:
+            if _fatal["dead"]:
+                break
             next_url = url
             page_count = 0
             while next_url and page_count < 10:  # 最多翻 10 页
                 result, err = _fetch_single_page(next_url, headers)
                 if result is None:
+                    etype = _classify_error(err)
+                    if etype in ("dns_failure", "connection_refused", "network_unreachable", "ssl_error"):
+                        _fatal["dead"] = True
+                        break
+                    if etype == "timeout":
+                        _fatal["timeouts"] += 1
+                        if _fatal["timeouts"] >= 2:
+                            _fatal["dead"] = True
+                            break
                     # 认证失败 → 尝试下一个 auth
                     if err and (err.startswith("HTTP 401") or err.startswith("HTTP 403")):
                         auth_failed = True
@@ -1386,11 +1640,24 @@ def fetch_models(endpoint: str, api_key: str, api_format: str = "", default_mode
                 all_404 = False
                 if result["models"]:
                     add_models(result["models"])
+                    if result.get("caps"):
+                        collected_caps.update(result["caps"])
                 next_url = result.get("next_url")
                 page_count += 1
 
     if collected_models:
-        return {"success": True, "models": collected_models}
+        final_models = collected_models
+        responses_filtered = False
+        if responses_only and collected_caps:
+            # 能力字段存在 → 只保留支持 responses 的模型
+            responses_filtered = True
+            final_models = [m for m in collected_models if collected_caps.get(m) is True]
+        if not final_models:
+            return {
+                "success": False,
+                "error": "该端点没有支持 Responses API 的模型，无法用于 Codex",
+            }
+        return {"success": True, "models": final_models, "responses_filtered": responses_filtered}
 
     # 全部 404 → 只返回供应商自己配置的模型，不混入第三方端点可能并不支持的通用列表
     if all_404:
@@ -1421,6 +1688,33 @@ def fetch_models(endpoint: str, api_key: str, api_format: str = "", default_mode
         }
 
     return {"success": False, "error": last_error or "获取失败"}
+
+
+def _extract_responses_capabilities(data) -> dict:
+    """从模型列表响应中提取 {模型ID: supports_responses 布尔值}。
+
+    只收录响应里显式带 supports_responses 字段的模型；字段缺失视为能力未知
+    （返回空 dict，调用方不应据此过滤，兼容不支持该字段的旧中继）。
+    """
+    caps: dict = {}
+
+    def scan(items):
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            mid = item.get("id") or item.get("name") or item.get("model")
+            if not isinstance(mid, str):
+                continue
+            mid = _normalize_model_id(mid)
+            if "supports_responses" in item and isinstance(item.get("supports_responses"), bool):
+                caps[mid] = item["supports_responses"]
+
+    if isinstance(data, dict):
+        scan(data.get("data"))
+        scan(data.get("models"))
+    return caps
 
 
 def _extract_model_ids(data) -> list:
@@ -1542,52 +1836,28 @@ def _get_known_models_by_format(api_format: str) -> list:
 def _send_post_request(url: str, headers: Dict[str, str], body: Dict) -> Dict[str, any]:
     """发送 POST 请求,返回包含响应体；失败时尽量带回上游错误正文"""
     data = json.dumps(body).encode("utf-8")
+    headers = dict(headers)
     headers.setdefault("User-Agent", _USER_AGENT)
 
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers=headers,
-        method="POST",
-    )
-
-    ctx = _create_ssl_context()
-    timeout = _get_timeout()
-
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as response:
-            body_text = response.read().decode("utf-8", errors="replace")
-            if response.status in (200, 201):
-                # 部分中继会用 200 返回业务错误 JSON
-                try:
-                    parsed = json.loads(body_text) if body_text else None
-                except json.JSONDecodeError:
-                    parsed = None
-                if isinstance(parsed, dict):
-                    # OpenAI 风格: {"error": {...}} 且无 choices/content
-                    if parsed.get("error") and not any(k in parsed for k in ("choices", "content", "output", "candidates")):
-                        return {"success": False, "error": _format_http_error(200, body_text), "body": body_text}
-                return {"success": True, "body": body_text}
-            else:
-                return {"success": False, "error": _format_http_error(response.status, body_text), "body": body_text}
-    except urllib.error.HTTPError as e:
-        body_text = _read_http_error_body(e)
-        # 401/403：对完整聊天测试应视为失败并返回上游 message，
-        # 这样 UI 能显示真实鉴权原因，而不是“格式不匹配”。
-        # 注意：此前把 401/403 当 success 会掩盖 key 问题，且 full 模式会落到 no_content。
-        return {
-            "success": False,
-            "error": _format_http_error(e.code, body_text),
-            "body": body_text,
-            "http_status": e.code,
-        }
-    except urllib.error.URLError as e:
-        return {
-            "success": False,
-            "error": _normalize_error_text(e.reason if e.reason is not None else e) or str(e.reason),
-        }
+        status, body_bytes = _http_open("POST", url, headers, data)
     except Exception as e:
         return {"success": False, "error": _normalize_error_text(e) or str(e)}
+
+    body_text = body_bytes.decode("utf-8", errors="replace")
+    if status in (200, 201):
+        # 部分中继会用 200 返回业务错误 JSON
+        try:
+            parsed = json.loads(body_text) if body_text else None
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            # OpenAI 风格: {"error": {...}} 且无 choices/content
+            if parsed.get("error") and not any(k in parsed for k in ("choices", "content", "output", "candidates")):
+                return {"success": False, "error": _format_http_error(200, body_text), "body": body_text}
+        return {"success": True, "body": body_text}
+    else:
+        return {"success": False, "error": _format_http_error(status, body_text), "body": body_text, "http_status": status}
 
 
 def test_all_providers(mode: str = "fast", callback=None, log_callback=None,

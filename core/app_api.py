@@ -715,14 +715,15 @@ class API:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def test_provider(self, provider_id):
-        """Test a single provider (full mode: send Hi, verify AI response)"""
+    def test_provider(self, provider_id, app_type=None):
+        """Test a single provider (full mode: send Hi, verify AI response)
+        app_type: 'claude' | 'codex' - 只测试该应用对应的绑定，默认用供应商顶层 app_type"""
         try:
             pid = int(provider_id)
             old_provider = db.get_provider_by_id(pid)
             old_status = old_provider.get("status") if old_provider else None
 
-            result = testing.test_provider(pid, "full", log_callback=self._push_cli_log)
+            result = testing.test_provider(pid, "full", log_callback=self._push_cli_log, app_type=app_type)
 
             # 状态变化时发送通知
             new_status = result.get("status")
@@ -735,7 +736,7 @@ class API:
 
             # 测试失败且是当前供应商，尝试 Failover
             if new_status == "fail":
-                fo_result = failover.check_and_failover(pid, log_callback=self._push_cli_log)
+                fo_result = failover.check_and_failover(pid, app_type=app_type, log_callback=self._push_cli_log)
                 if fo_result.get("switched"):
                     notifications.notify(
                         "failover", "自动故障切换",
@@ -760,6 +761,7 @@ class API:
 
         def run_tests():
             try:
+                self._push_cli_clear()
                 def callback(pid, result):
                     if self._stop_event.is_set():
                         return
@@ -767,7 +769,11 @@ class API:
 
                     # 测试失败且是当前供应商，尝试 Failover
                     if result.get("status") == "fail":
-                        fo_result = failover.check_and_failover(pid, log_callback=self._push_cli_log)
+                        _fp = db.get_provider_by_id(pid) or {}
+                        fo_result = failover.check_and_failover(
+                            pid, app_type=_fp.get("app_type") or "claude",
+                            log_callback=self._push_cli_log,
+                        )
                         if fo_result.get("switched"):
                             notifications.notify(
                                 "failover", "自动故障切换",
@@ -1538,6 +1544,14 @@ del "%~f0" >nul 2>&1
             self._window.evaluate_js(js)
         except Exception as e:
             logger.warning(f"Push cli_log failed: {e}")
+
+    def _push_cli_clear(self):
+        if not self._window:
+            return
+        try:
+            self._window.evaluate_js("if (window.app) { window.app.clearCliLog(); }")
+        except Exception as e:
+            logger.warning(f"Push cli_clear failed: {e}")
 
     def _push_testing_complete(self):
         if self._window:

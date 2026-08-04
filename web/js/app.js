@@ -1,4 +1,4 @@
-/**
+﻿/**
  * API Monitor - Frontend App
  * Direction A · Arcade Cabinet — topnav + hero metrics + provider list + detail
  */
@@ -679,10 +679,14 @@ class App {
         if (!detailInfo) return;
 
         // ── Build model info card from current provider's apps ──
+        // 只展示当前分页（Claude Code / Codex）对应的应用绑定，不混显另一分页的信息
         let modelInfoHtml = '';
         const provider = this.providers.find(p => String(p.id) === String(this.selectedProviderId));
-        if (provider && provider.apps && provider.apps.length) {
-            const rows = provider.apps.map(b => {
+        const appBindings = (provider && provider.apps && provider.apps.length)
+            ? provider.apps.filter(b => b.app_type === this.activeApp)
+            : [];
+        if (appBindings.length) {
+            const rows = appBindings.map(b => {
                 const appLabel = b.app_type === 'codex' ? 'Codex' : 'Claude Code';
                 const model = b.default_model || '未设置';
                 const effort = b.reasoning_effort ? ({low:'Low · 快速', medium:'Medium · 平衡', high:'High · 深度'}[b.reasoning_effort] || b.reasoning_effort) : '跟随应用默认';
@@ -738,8 +742,7 @@ class App {
                 parts.push(`<div class="cli-result cli-result-${cls}">
                     <span class="cli-result-icon">${icon}</span>
                     <span class="cli-result-label">${label}</span>
-                    <span class="cli-result-body">${tag}${text}</span>
-                    <span class="cli-result-time">${time}</span>
+                    <span class="cli-result-body">${tag}${text} <span class="cli-result-time">${time}</span></span>
                 </div>`);
                 lastResultIdx = parts.length - 1;
             } else {
@@ -1142,6 +1145,14 @@ class App {
         const t = p.app_type || 'claude';
         return t === app || t === 'both';
     }
+        _appRole(provider) {
+                const app = this.activeApp;
+                if (provider.apps && Array.isArray(provider.apps)) {
+                        const b = provider.apps.find(x => x.app_type === app);
+                        if (b) return b.role || '备用';
+                }
+                return provider.role || '备用';
+    }
 
     applyAppFilter() {
         this.filteredProviders = this.providers.filter(p => this._providerForApp(p, this.activeApp));
@@ -1240,15 +1251,16 @@ class App {
             if (sc === 'ok') tr.classList.add('row-ok');
             else if (sc === 'fail') tr.classList.add('row-fail');
             else if (sc === 'testing') tr.classList.add('row-testing');
-            const roleClass   = provider.role === '当前' ? 'current' : 'backup';
+            const _role = this._appRole(provider);
+            const roleClass   = _role === '当前' ? 'current' : 'backup';
             const isChecked = this.selectedIds.has(String(provider.id));
-            if (provider.role === '当前') tr.classList.add('row-current');
+            if (_role === '当前') tr.classList.add('row-current');
 
             tr.innerHTML = `
                 <td class="col-check"><input type="checkbox" class="row-check" data-id="${provider.id}" ${isChecked ? 'checked' : ''}></td>
                 <td><span class="plc-name"><span class="row-caret" aria-hidden="true">▶</span>${this._highlight(provider.name, this._searchKeywords)}</span></td>
                 <td><span class="plc-endpoint" title="${this.escape(provider.endpoint || '')}">${this._highlight(provider.endpoint || '-', this._searchKeywords)}</span></td>
-                <td><span class="role-badge ${roleClass}">${provider.role === '当前' ? 'CUR' : this.escape(provider.role || '-')}</span></td>
+                <td><span class="role-badge ${roleClass}">${_role === '当前' ? 'CUR' : this.escape(_role || '-')}</span></td>
                 <td class="col-ping">${this._pingCell(provider.latency)}</td>
                 <td><span class="status-pill ${sc}">${this.statusIcon(sc)} ${st}</span></td>
             `;
@@ -1289,7 +1301,7 @@ class App {
             if (sc === 'ok') existingRow.classList.add('row-ok');
             else if (sc === 'fail') existingRow.classList.add('row-fail');
             else if (sc === 'testing') existingRow.classList.add('row-testing');
-            existingRow.classList.toggle('row-current', p.role === '当前');
+            existingRow.classList.toggle('row-current', this._appRole(p) === '当前');
             const cells = existingRow.querySelectorAll('td');
             if (cells.length >= 6) {
                 // 名称 (index 1, 因为 0 是复选框)：复用整表渲染的模板（含插入符与搜索高亮）
@@ -1330,10 +1342,38 @@ class App {
         this.pushLog(level, text, name);
     }
 
+    clearCliLog() {
+        this.clearCliLogs();
+    }
+
+    clearCliLogs() {
+        this.cliLogs = [];
+        if (this.activeDetailTab === 'cli' && this.selectedProviderId != null) {
+            this.renderCliTab();
+        }
+    }
+
     testingComplete() {
         this.setTestingState(false);
+        this._reportBatchDuration();
         // 测试结束后做一次完整刷新(排序可能变化)
         this.loadData(false);
+    }
+
+    _fmtDur(ms) {
+        const s = ms / 1000;
+        if (s < 60) return s.toFixed(1) + 's';
+        const m = Math.floor(s / 60);
+        return m + '分' + (s % 60).toFixed(1) + 's';
+    }
+
+    _reportBatchDuration() {
+        if (this._batchTestStart == null) return;
+        const ms = performance.now() - this._batchTestStart;
+        this._batchTestStart = null;
+        const dur = this._fmtDur(ms);
+        this.pushLog('info', `批量测试结束 · 总耗时 ${dur}`);
+        this.toast(`批量测试完成 · 总耗时 ${dur}`, 'success');
     }
 
     statusClass(s) {
@@ -1553,7 +1593,7 @@ class App {
                         </div>
                         <div class="info-item">
                             <div class="info-label">角色</div>
-                            <div class="info-value"><span class="role-badge ${provider.role === '当前' ? 'current' : 'backup'}">${this.escape(provider.role || '-')}</span></div>
+                            <div class="info-value"><span class="role-badge ${(provider.apps ? (provider.apps.find(a => a.app_type === this.activeApp) || {}).role || provider.role : provider.role) === '当前' ? 'current' : 'backup'}">${this.escape((provider.apps ? (provider.apps.find(a => a.app_type === this.activeApp) || {}).role || provider.role : provider.role) || '-')}</span></div>
                         </div>
                         <div class="info-item">
                             <div class="info-label">超时设置</div>
@@ -1631,9 +1671,8 @@ class App {
                     <div style="margin-top:14px;">
                         <div class="dc-section-title">测试详情</div>
                         <div class="test-list">
-                            <div class="test-row">
+                            <div class="test-detail-row">
                                 <span class="test-row-label">测试时间</span>
-                                <div></div>
                                 <span class="test-row-val mono">${this.escape(lastTestTime)}</span>
                             </div>
                             <div class="test-detail-row ${detailCardClass}">
@@ -1748,6 +1787,8 @@ class App {
     async testAll(mode) {
         if (this.isTesting) return;
         this.setTestingState(true);
+        this._batchTestStart = performance.now();
+        this.clearCliLogs();
         this.pushLog('info', `开始批量${mode === 'full' ? '完整' : '快速'}测试 (${this.filteredProviders.length} 个)...`);
         this.toast(`开始${mode === 'full' ? '完整' : '快速'}测试`, 'info');
         try {
@@ -1756,6 +1797,7 @@ class App {
             if (!r?.success) {
                 this.pushLog('err', r?.error || '启动失败');
                 this.setTestingState(false);
+                this._reportBatchDuration();
             }
             // 真实后端在测试中通过 _refresh_frontend 推送刷新;模拟后端自行驱动刷新
         } catch (error) {
@@ -2291,13 +2333,15 @@ class App {
         const ids = [...this.selectedIds];
         if (!ids.length) return;
         this.setTestingState(true);
+        this.clearCliLogs();
         this.pushLog('info', `开始批量测试 ${ids.length} 个提供商...`);
+        const t0 = performance.now();
         for (const id of ids) {
             if (!this.isTesting) break;
             // pushLog 第三参是供应商名（CLI 页签按名称过滤日志）
             const pName = this.providers.find(p => String(p.id) === String(id))?.name || '';
             try {
-                const r = await this.backend().test_provider(id);
+                const r = await this.backend().test_provider(id, this.activeApp);
                 if (r?.success) {
 
                 } else {
@@ -2310,6 +2354,7 @@ class App {
         this.setTestingState(false);
         this.clearSelection();
         await this.loadData(false);
+        this.pushLog('info', `批量测试结束 · 总耗时 ${this._fmtDur(performance.now() - t0)}`);
         this.toast('批量测试完成', 'success');
     }
 
@@ -2354,13 +2399,17 @@ class App {
         if (this.testingIds.has(p.id)) return;  // already testing this one
         this.testingIds.add(p.id);
         this._updateTestBtnState(p.id);
+        this.clearCliLogs();
+        const t0 = performance.now();
         try {
-            const r = await this.backend().test_provider(p.id);
+            const r = await this.backend().test_provider(p.id, this.activeApp);
+            const dur = this._fmtDur(performance.now() - t0);
             if (r?.success) {
                 this.toast(`${p.name} 正常`, 'success');
             } else {
                 this.toast(`${p.name} 失败`, 'error');
             }
+            this.pushLog('info', `${p.name} 测试结束 · 总耗时 ${dur}`, p.name);
             await this.loadData(false);
             // Only re-select if user hasn't switched away
             if (this.selectedProviderId == p.id) this.selectProvider(p.id);
@@ -2551,6 +2600,8 @@ class App {
         set('setAutoInterval', s.auto_test_interval || '0');
         set('setConcurrency', s.test_concurrency || '3');
         set('setTimeout', s.test_timeout || '30');
+        set('setConnectTimeout', s.test_connect_timeout || '5');
+        set('setMaxDuration', s.test_max_duration || '60');
         set('setRetries', s.test_retries || '2');
         setCheck('setSslVerify', s.ssl_verify);
         setCheck('setAutoSyncClaude', s.auto_sync_claude_on_startup);
@@ -2586,6 +2637,8 @@ class App {
             auto_test_interval: get('setAutoInterval'),
             test_concurrency: get('setConcurrency'),
             test_timeout: get('setTimeout'),
+            test_connect_timeout: get('setConnectTimeout'),
+            test_max_duration: get('setMaxDuration'),
             test_retries: get('setRetries'),
             ssl_verify: getCheck('setSslVerify'),
             auto_sync_claude_on_startup: getCheck('setAutoSyncClaude'),
@@ -3048,14 +3101,30 @@ class App {
         const label = document.getElementById('failoverBannerText');
         if (label) label.textContent = msg || '建议故障切换';
         if (banner) banner.style.display = 'flex';
+        // 5 秒内未点击任何按钮 → 自动消失且不做任何改动（等同取消待确认切换）。
+        // 已有定时器则不重置，保证从横幅出现起只计一次 5 秒
+        if (!this._failoverBannerTimer) {
+            this._failoverBannerTimer = setTimeout(() => {
+                this._failoverBannerTimer = null;
+                this.cancelFailover(true);
+            }, 5000);
+        }
     }
 
     hideFailoverBanner() {
+        if (this._failoverBannerTimer) {
+            clearTimeout(this._failoverBannerTimer);
+            this._failoverBannerTimer = null;
+        }
         const banner = document.getElementById('failoverBanner');
         if (banner) banner.style.display = 'none';
     }
 
     async confirmFailover() {
+        if (this._failoverBannerTimer) {
+            clearTimeout(this._failoverBannerTimer);
+            this._failoverBannerTimer = null;
+        }
         try {
             const r = await this.backend().confirm_failover();
             if (r?.switched) {
@@ -3070,13 +3139,17 @@ class App {
         }
     }
 
-    async cancelFailover() {
+    async cancelFailover(auto = false) {
+        if (this._failoverBannerTimer) {
+            clearTimeout(this._failoverBannerTimer);
+            this._failoverBannerTimer = null;
+        }
         try {
             await this.backend().cancel_failover();
             this.hideFailoverBanner();
-            this.toast('已取消切换', 'success');
+            if (!auto) this.toast('已取消切换', 'success');
         } catch (e) {
-            this.toast('取消失败: ' + e.message, 'error');
+            if (!auto) this.toast('取消失败: ' + e.message, 'error');
         }
     }
 
@@ -3362,7 +3435,7 @@ class MockBackend {
         return { success: list.length < before };
     }
 
-    async test_provider(id, mode = 'fast') {
+    async test_provider(id, app, mode = 'fast') {
         const list = this._load();
         const p = list.find(x => String(x.id) === String(id));
         if (!p) return { success: false, error: '供应商不存在' };
