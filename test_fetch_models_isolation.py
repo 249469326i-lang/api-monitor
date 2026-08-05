@@ -1243,5 +1243,185 @@ class CodexConfigTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self._codex_config_path()))
 
 
+class DeepSeekCodexProviderTest(unittest.TestCase):
+    """Codex + DeepSeek 专用回归测试。
+
+    DeepSeek 的 OpenAI Responses API 目前仅支持 deepseek-v4-flash
+    （deepseek-v4-pro / 旧别名 deepseek-chat 均不支持），且 Responses 的
+    base_url 必须是根路径 https://api.deepseek.com（不能追加 /v1）。
+    """
+
+    def test_resolve_codex_model_deepseek_picks_v4flash_when_default_empty(self):
+        provider = {"api_key": "sk-ds", "name": "DeepSeek"}
+        binding = {"endpoint": "https://api.deepseek.com", "default_model": "", "api_format": ""}
+        # DeepSeek 官方 /models 不带 supports_responses 字段 → responses_filtered=False
+        with patch("core.testing.fetch_models", return_value={
+            "success": True,
+            "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
+            "responses_filtered": False,
+        }):
+            model, catalog, warning = providers._resolve_codex_model(provider, binding)
+        self.assertEqual(model, "deepseek-v4-flash")
+        self.assertEqual(catalog, ["deepseek-v4-flash"])
+        self.assertEqual(warning, "")
+
+    def test_resolve_codex_model_deepseek_swaps_explicit_v4pro(self):
+        provider = {"api_key": "sk-ds", "name": "DeepSeek"}
+        binding = {"endpoint": "https://api.deepseek.com", "default_model": "deepseek-v4-pro", "api_format": ""}
+        with patch("core.testing.fetch_models", return_value={
+            "success": True,
+            "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+            "responses_filtered": False,
+        }):
+            model, catalog, warning = providers._resolve_codex_model(provider, binding)
+        self.assertEqual(model, "deepseek-v4-flash")
+        self.assertIn("deepseek-v4-pro", warning)
+        self.assertIn("deepseek-v4-flash", warning)
+
+    def test_resolve_codex_model_relay_keeps_user_model(self):
+        # 非 DeepSeek 中继不强制换模型，保留用户配置（回归保护）
+        provider = {"api_key": "sk-x", "name": "Relay"}
+        binding = {"endpoint": "https://relay.example.com", "default_model": "qwen-max", "api_format": ""}
+        with patch("core.testing.fetch_models", return_value={
+            "success": True,
+            "models": ["qwen-max", "qwen-turbo"],
+            "responses_filtered": False,
+        }):
+            model, catalog, warning = providers._resolve_codex_model(provider, binding)
+        self.assertEqual(model, "qwen-max")
+        self.assertEqual(warning, "")
+
+    def test_write_codex_config_deepseek_base_url_keeps_root(self):
+        path = os.path.join(_MODULE_TMP, "codex_config_deepseek.toml")
+        if os.path.exists(path):
+            os.remove(path)
+        provider = {"name": "DeepSeek", "api_key": "sk-ds"}
+        binding = {"endpoint": "https://api.deepseek.com", "default_model": "deepseek-v4-flash"}
+        with patch.object(providers, "_get_codex_config_path", return_value=path), \
+             patch.object(providers, "_write_codex_catalog", return_value=""):
+            providers._write_codex_config(provider, binding, model="deepseek-v4-flash")
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = tomllib.loads(f.read())
+        mp = cfg["model_providers"]["api_monitor"]
+        self.assertEqual(mp["base_url"], "https://api.deepseek.com")
+        self.assertEqual(mp["wire_api"], "responses")
+
+    def test_write_codex_config_relay_base_url_appends_v1(self):
+        # 通用中继依旧补 /v1（回归保护，避免误伤其它中转厂）
+        path = os.path.join(_MODULE_TMP, "codex_config_relay.toml")
+        if os.path.exists(path):
+            os.remove(path)
+        provider = {"name": "Relay", "api_key": "sk-x"}
+        binding = {"endpoint": "https://relay.example.com", "default_model": "qwen-max"}
+        with patch.object(providers, "_get_codex_config_path", return_value=path), \
+             patch.object(providers, "_write_codex_catalog", return_value=""):
+            providers._write_codex_config(provider, binding, model="qwen-max")
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = tomllib.loads(f.read())
+        self.assertEqual(cfg["model_providers"]["api_monitor"]["base_url"], "https://relay.example.com/v1")
+
+    def test_deepseek_codex_responses_test_uses_v4flash_fallback_and_succeeds(self):
+        """Codex 完整测试：DeepSeek 空模型时 Responses 用 deepseek-v4-flash，
+        且 /responses 请求成功 → 测试通过。"""
+        seen = []
+
+        def fake_urlopen(req, timeout=None, context=None):
+            seen.append(req.full_url)
+            body = json.loads(req.data.decode("utf-8"))
+            if req.full_url == "https://api.deepseek.com/responses" and body.get("model") == "deepseek-v4-flash":
+                return _FakeResponse({
+                    "output": [
+                        {"type": "message", "content": [
+                            {"type": "output_text", "text": "Hello from DeepSeek responses"},
+                        ]}
+                    ]
+                })
+            raise urllib.error.HTTPError(
+                req.full_url, 400, "bad request", hdrs=None, fp=io.BytesIO(b""),
+            )
+
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
+            result = testing._test_chat_endpoint(
+                "https://api.deepseek.com",
+                "sk-ds",
+                "",
+                "codex",
+                api_format="openai_responses",
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["api_format"], "openai_responses")
+        self.assertEqual(result["response_snippet"], "Hello from DeepSeek responses")
+        self.assertTrue(any(u.endswith("/responses") for u in seen))
+    def test_deepseek_codex_responses_uses_v4flash_even_when_v4pro_configured(self):
+        """配置了 deepseek-v4-pro 时，Codex Responses 测试仍强制用 deepseek-v4-flash
+        （否则 /responses 会收到 400：模型不支持）。"""
+        seen = []
+
+        def fake_urlopen(req, timeout=None, context=None):
+            seen.append(req.full_url)
+            body = json.loads(req.data.decode("utf-8"))
+            if req.full_url == "https://api.deepseek.com/v1/responses" and body.get("model") == "deepseek-v4-flash":
+                return _FakeResponse({
+                    "output": [
+                        {"type": "message", "content": [
+                            {"type": "output_text", "text": "Hello from DeepSeek responses"},
+                        ]}
+                    ]
+                })
+            raise urllib.error.HTTPError(
+                req.full_url, 400, "model not supported", hdrs=None, fp=io.BytesIO(b""),
+            )
+
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
+            result = testing._test_chat_endpoint(
+                "https://api.deepseek.com/v1",
+                "sk-ds",
+                "deepseek-v4-pro",
+                "codex",
+                api_format="openai_responses",
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["api_format"], "openai_responses")
+        self.assertTrue(any(u.endswith("/v1/responses") for u in seen))
+
+    def test_non_deepseek_responses_keeps_configured_model(self):
+        """非 DeepSeek 中继的 Responses 测试保留配置的模型，不强制替换。"""
+        seen = []
+
+        def fake_urlopen(req, timeout=None, context=None):
+            seen.append(req.full_url)
+            body = json.loads(req.data.decode("utf-8"))
+            if req.full_url == "https://relay.example.com/v1/responses" and body.get("model") == "qwen-max":
+                return _FakeResponse({
+                    "output": [
+                        {"type": "message", "content": [
+                            {"type": "output_text", "text": "Hello from relay"},
+                        ]}
+                    ]
+                })
+            raise urllib.error.HTTPError(
+                req.full_url, 400, "bad request", hdrs=None, fp=io.BytesIO(b""),
+            )
+
+        with patch("core.testing._http_open", side_effect=_adapt_http_open(fake_urlopen)):
+            result = testing._test_chat_endpoint(
+                "https://relay.example.com/v1",
+                "sk-x",
+                "qwen-max",
+                "codex",
+                api_format="openai_responses",
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["api_format"], "openai_responses")
+        self.assertTrue(any(u.endswith("/v1/responses") for u in seen))
+
+
+
+
+
+
 if __name__ == "__main__":
     unittest.main()

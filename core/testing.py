@@ -1122,9 +1122,19 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
 
     _effort = reasoning_effort.strip() if reasoning_effort else ""
     # 上下文长度作为请求的 max_tokens/max_output_tokens 上限：
-    # 验证当前配置的上下文长度确实被模型/端点接受
-    _ctx = int(context_length or 0)
-    _max_tokens = _ctx if _ctx > 0 else 256
+    # 验证当前配置的上下文长度确实被模型/端点接受。
+    # 注意：用户常把 context_length 当「上下文窗口」填（如 1M），但这里它是
+    # 输出 token 上限；若直接沿用，超过供应商允许范围（如 DeepSeek 官方 393216）
+    # 会被上游以 HTTP 400 "Invalid max_tokens value" 拒绝。因此发送前钳制到
+    # 供应商允许的安全值，_ctx 原值保留用于日志/展示。
+    # 钳制阈值由 core/db.py 统一提供（DEEPSEEK_TOKEN_CAP / GENERIC_TOKEN_CAP /
+    # is_deepseek_endpoint），与保存时的 _normalize_context_length 保持一致。
+    try:
+        _ctx = int(context_length or 0)
+    except (TypeError, ValueError):
+        _ctx = 0
+    _ctx_cap = db.DEEPSEEK_TOKEN_CAP if db.is_deepseek_endpoint(endpoint) else db.GENERIC_TOKEN_CAP
+    _max_tokens = max(1, min(_ctx, _ctx_cap)) if _ctx > 0 else 256
 
     attempt_errors = []
     # 死端点短路：DNS 解析失败/连接拒绝/网络不可达意味着同一 host 的
@@ -1205,7 +1215,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
     def _try_openai_chat():
         if model:
             oai_model = model
-        elif "api.deepseek.com" in endpoint.lower():
+        elif db.is_deepseek_endpoint(endpoint):
             oai_model = "deepseek-chat"
         else:
             oai_model = "gpt-3.5-turbo"
@@ -1242,12 +1252,23 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
         return None
 
     def _try_openai_responses():
-        oai_model = model if model else "gpt-4o-mini"
+        # DeepSeek 的 Responses API 目前仅支持 deepseek-v4-flash：即使配置了
+        # deepseek-v4-pro / 旧别名，也必须用 v4-flash 测试，否则 /responses
+        # 会返回 400（模型不支持）。配置的模型本身已是 v4-flash 系列则照用。
+        if db.is_deepseek_endpoint(endpoint):
+            if "deepseek-v4-flash" in (model or "").strip().lower():
+                oai_model = model
+            else:
+                oai_model = "deepseek-v4-flash"
+        elif model:
+            oai_model = model
+        else:
+            oai_model = "gpt-4o-mini"
         body = {"model": oai_model, "input": "你是谁呀，小朋友"}
         if _effort:
             body["reasoning_effort"] = _effort
         if _ctx > 0:
-            body["max_output_tokens"] = _ctx
+            body["max_output_tokens"] = _max_tokens
         paths = ["responses"]
         if not endpoint.endswith("/v1"):
             paths.append("v1/responses")
@@ -1275,7 +1296,7 @@ def _test_chat_endpoint(endpoint: str, api_key: str, model: str = "", app_type: 
         gemini_model = model if model else "gemini-2.0-flash"
         body = {"contents": [{"parts": [{"text": "你是谁呀，小朋友"}]}]}
         if _ctx > 0:
-            body["generationConfig"] = {"maxOutputTokens": _ctx}
+            body["generationConfig"] = {"maxOutputTokens": _max_tokens}
         model_names = [gemini_model] if model else ["gemini-2.0-flash", "gemini-1.5-flash"]
         for m in model_names:
             if _fatal["dead"] or _expired():

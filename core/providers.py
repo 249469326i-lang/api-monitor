@@ -13,6 +13,7 @@ import hashlib
 import datetime
 import re
 import tomllib
+import urllib.parse
 from typing import List, Dict, Any, Optional
 from . import db
 
@@ -898,6 +899,23 @@ def _write_codex_catalog(models) -> str:
         return ""
 
 
+def _is_deepseek_endpoint(url: str) -> bool:
+    """判断端点是否为 DeepSeek 官方 API（api.deepseek.com）。"""
+    try:
+        host = urllib.parse.urlparse(url or "").hostname or ""
+    except Exception:
+        host = (url or "").lower()
+    host = (host or "").lower()
+    return "deepseek.com" in host
+
+
+def _deepseek_responses_supported(model_id: str) -> bool:
+    """DeepSeek 的 Responses API 目前仅支持 deepseek-v4-flash。
+    deepseek-v4-pro（及旧别名 deepseek-chat / deepseek-reasoner）尚不支持 Responses 接口，
+    Codex 场景必须用 v4-flash 系列，否则 /responses 会被 DeepSeek 拒绝。"""
+    return "deepseek-v4-flash" in (model_id or "").strip().lower()
+
+
 def _resolve_codex_model(provider: Dict[str, Any], binding: Dict[str, Any]) -> tuple:
     """解析要写入 config.toml 的默认模型。
 
@@ -926,6 +944,16 @@ def _resolve_codex_model(provider: Dict[str, Any], binding: Dict[str, Any]) -> t
                 models = [m.strip() for m in (fetched.get("models") or []) if isinstance(m, str) and m.strip()]
                 if models:
                     responses_filtered = bool(fetched.get("responses_filtered"))
+                    # DeepSeek 特判：其官方 /models 不带 supports_responses 字段，导致上面
+                    # responses_only 的能力过滤失效；而 DeepSeek 的 Responses API 目前仅支持
+                    # deepseek-v4-flash（v4-pro / 旧别名 deepseek-chat 等均不支持）。这里
+                    # 显式把不支持 Responses 的模型剔除，避免把 v4-pro 写进 Codex 配置。
+                    ds = _is_deepseek_endpoint(endpoint)
+                    if ds:
+                        ds_supported = [m for m in models if _deepseek_responses_supported(m)]
+                        if ds_supported:
+                            models = ds_supported
+                            responses_filtered = True
                     if not model:
                         model = models[0]
                     elif model not in models:
@@ -942,6 +970,15 @@ def _resolve_codex_model(provider: Dict[str, Any], binding: Dict[str, Any]) -> t
                         else:
                             # 无能力信息：模型列表可能只是别名，保留用户配置
                             models = [model] + models
+                    # DeepSeek 场景：用户显式配置了非 v4-flash 模型（如 deepseek-v4-pro /
+                    # deepseek-chat）时强制纠正，避免 /responses 被拒。
+                    elif ds and not _deepseek_responses_supported(model):
+                        match = next((m for m in models if _deepseek_responses_supported(m)), models[0] if models else model)
+                        warning = (
+                            f"{model} 不支持 Responses API，已改用 {match} 供 Codex 使用。"
+                            "DeepSeek 仅 deepseek-v4-flash 支持 Responses 接口"
+                        )
+                        model = match
                     catalog_models = models
         except Exception:
             catalog_models = None
@@ -997,8 +1034,14 @@ def _write_codex_config(provider: Dict[str, Any], binding: Optional[Dict[str, An
     # base_url: Codex 会在 base_url 后拼 "/responses"（Responses API），
     # 而中转厂标准路径是 /v1/responses（/v1/models 同理）。endpoint 不带
     # /v1 时补上，否则会打到 /responses 得到 405。
+    # 例外：DeepSeek 官方 Responses API 的基地址是根路径 https://api.deepseek.com
+    # （不带 /v1），追加 /v1 反而打到非文档化路径 /v1/responses。
     base_url = endpoint
-    if wire_api == "responses" and not base_url.rstrip("/").endswith("/v1"):
+    if (
+        wire_api == "responses"
+        and not _is_deepseek_endpoint(base_url)
+        and not base_url.rstrip("/").endswith("/v1")
+    ):
         base_url = base_url.rstrip("/") + "/v1"
 
     section = f"model_providers.{CODEX_PROVIDER_SLUG}"

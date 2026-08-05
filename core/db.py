@@ -5,8 +5,27 @@
 import sqlite3
 import os
 import time
+import urllib.parse
 from contextlib import contextmanager
 from typing import List, Dict, Optional, Any
+
+
+# 供应商输出 token 上限（max_tokens / max_output_tokens）的统一来源：
+# 用户常把 context_length 当「上下文窗口」填（如 1M），但它在请求里是
+# 输出上限；DeepSeek 官方只接受 [1, 393216]，其它中继取一个通用防御上限。
+# 测试引擎（core/testing.py）与入库归一（_normalize_context_length）共用它们，
+# 避免两处判断不一致导致「保存时 393216、发请求时又被压到 128000」的错位。
+DEEPSEEK_TOKEN_CAP = 393216
+GENERIC_TOKEN_CAP = 128000
+
+
+def is_deepseek_endpoint(endpoint: str) -> bool:
+    """统一判断端点是否属于 DeepSeek（官方 api.deepseek.com 或 *.deepseek.com 兼容端点）。"""
+    try:
+        host = urllib.parse.urlparse(endpoint or "").hostname or ""
+    except Exception:
+        host = (endpoint or "").lower()
+    return "deepseek.com" in (host or "").lower()
 
 
 def get_db_path() -> str:
@@ -211,6 +230,24 @@ def _encrypt_api_key(plaintext: str) -> str:
     """加密 API Key（延迟导入避免循环依赖）"""
     from . import crypto
     return crypto.encrypt_key(plaintext)
+
+
+def _normalize_context_length(context_length: Any, endpoint: str = "") -> int:
+    """把用户配置的 context_length 钳制到供应商允许的输出上限后入库。
+
+    用户常把 context_length 当「上下文窗口」填（如 1M），但它实际作为
+    max_tokens/max_output_tokens 的输出上限使用；超出供应商允许范围
+    （如 DeepSeek 官方 393216）会在真实请求/测试时被上游以 HTTP 400
+    "Invalid max_tokens value" 拒绝。这里保存时即钳制到安全上限。
+    """
+    try:
+        ctx = int(context_length or 0)
+    except (TypeError, ValueError):
+        return 0
+    if ctx <= 0:
+        return 0
+    cap = DEEPSEEK_TOKEN_CAP if is_deepseek_endpoint(endpoint) else GENERIC_TOKEN_CAP
+    return max(1, min(ctx, cap))
 
 
 def _decrypt_api_key(stored: str) -> str:
@@ -473,7 +510,8 @@ def add_provider(provider_data: Dict[str, Any]) -> int:
                     "INSERT INTO provider_apps (provider_id, app_type, endpoint, default_model, api_format, reasoning_effort, context_length, role) "
                     "VALUES (?,?,?,?,?,?,?,?)",
                     (pid, b.get("app_type"), b.get("endpoint") or "", b.get("default_model") or "",
-                     b.get("api_format") or "", b.get("reasoning_effort") or "", b.get("context_length") or 0,
+                     b.get("api_format") or "", b.get("reasoning_effort") or "",
+                     _normalize_context_length(b.get("context_length"), b.get("endpoint")),
                      b.get("role") or "备用"),
                 )
         else:
@@ -543,7 +581,8 @@ def update_provider(provider_id: int, provider_data: Dict[str, Any]) -> bool:
                     "reasoning_effort=excluded.reasoning_effort, context_length=excluded.context_length",
                     (provider_id, b.get("app_type"), b.get("endpoint") or "",
                      b.get("default_model") or "", b.get("api_format") or "",
-                     b.get("reasoning_effort") or "", b.get("context_length") or 0),
+                     b.get("reasoning_effort") or "",
+                     _normalize_context_length(b.get("context_length"), b.get("endpoint"))),
                 )
             # 同步 providers 镜像列（app_type/role/endpoint/default_model/api_format）
             _sync_provider_mirrors(cursor, provider_id)
