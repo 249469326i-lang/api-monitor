@@ -791,6 +791,7 @@ DEFAULT_SETTINGS = {
     "ssl_verify": "1",                # SSL 验证
     "auto_sync_claude_on_startup": "1",  # 启动时自动同步 Claude Code 当前配置为供应商 1=开启 0=关闭
     "auto_sync_codex_on_startup": "1",   # 启动时自动同步 Codex 当前配置为供应商 1=开启 0=关闭
+    "auto_update": "1",                  # 启动时自动检查更新 1=开启 0=关闭
 }
 
 

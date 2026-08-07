@@ -807,6 +807,10 @@ class App {
 
     async _checkForUpdate() {
         try {
+            // 尊重设置：关闭自动检查时不联网
+            const s = await this.backend().get_all_settings();
+            const autoUpdate = s?.success ? String(s.data?.auto_update ?? '1') : '1';
+            if (autoUpdate === '0' || autoUpdate === 'false') return;
             const r = await this.backend().check_update();
             if (r?.success && r.data?.has_update) {
                 this._showUpdateModal(r.data);
@@ -845,14 +849,14 @@ class App {
         document.body.appendChild(overlay);
 
         document.getElementById('updateStartBtn')?.addEventListener('click', () => {
-            this._startUpdateDownload(data.download_url);
+            this._startUpdateDownload(data.download_url, data.sha256);
         });
         document.getElementById('updateLaterBtn')?.addEventListener('click', () => {
             overlay.remove();
         });
     }
 
-    _startUpdateDownload(downloadUrl) {
+    _startUpdateDownload(downloadUrl, sha256) {
         const body = document.getElementById('updateModalBody');
         if (!body) return;
         body.innerHTML = `
@@ -868,7 +872,7 @@ class App {
         document.getElementById('updateCancelBtn')?.addEventListener('click', () => {
             this._cancelUpdateDownload();
         });
-        this.backend().download_update(downloadUrl);
+        this.backend().download_update(downloadUrl, sha256 || '');
     }
 
     updateDownloadProgress(percent, downloadedMb, totalMb) {
@@ -911,7 +915,7 @@ class App {
             </div>
         `;
         document.getElementById('updateRetryBtn')?.addEventListener('click', () => {
-            if (this._updateData) this._startUpdateDownload(this._updateData.download_url);
+            if (this._updateData) this._startUpdateDownload(this._updateData.download_url, this._updateData.sha256);
         });
         document.getElementById('updateCloseBtn')?.addEventListener('click', () => {
             const m = document.getElementById('updateModal');
@@ -934,7 +938,7 @@ class App {
             </div>
         `;
         document.getElementById('updateRetryBtn')?.addEventListener('click', () => {
-            if (this._updateData) this._startUpdateDownload(this._updateData.download_url);
+            if (this._updateData) this._startUpdateDownload(this._updateData.download_url, this._updateData.sha256);
         });
         document.getElementById('updateCloseBtn')?.addEventListener('click', () => {
             const m = document.getElementById('updateModal');
@@ -2647,6 +2651,7 @@ class App {
         set('setRetentionDays', s.history_retention_days || '30');
         setCheck('setAutoBackup', s.auto_backup_enabled);
         setCheck('setStartOnBoot', s.start_on_boot);
+        setCheck('setAutoUpdate', s.auto_update);
         // 默认开启关窗到托盘
         const minTray = s.minimize_to_tray;
         setCheck('setMinimizeToTray', minTray === undefined || minTray === null || minTray === '' ? '1' : minTray);
@@ -2684,6 +2689,7 @@ class App {
             history_retention_days: get('setRetentionDays'),
             auto_backup_enabled: getCheck('setAutoBackup'),
             start_on_boot: getCheck('setStartOnBoot'),
+            auto_update: getCheck('setAutoUpdate'),
             minimize_to_tray: (document.getElementById('setMinimizeToTray') ? getCheck('setMinimizeToTray') : '1'),
             bg_rate: get('setBgRate'),
             bg_nodes: get('setBgNodes'),

@@ -1155,7 +1155,7 @@ class API:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def download_update(self, download_url):
+    def download_update(self, download_url, sha256=""):
         """在后台线程下载更新文件，通过 evaluate_js 推送进度"""
         try:
             from . import updater
@@ -1188,6 +1188,7 @@ class API:
                         download_url,
                         progress_callback=_progress_cb,
                         cancel_event=self._update_cancel,
+                        sha256=sha256,
                     )
                     if self._window:
                         js = f'if(window.app)window.app.updateDownloadComplete("{temp_path.replace(chr(92),chr(92)*2)}");'
@@ -1251,33 +1252,9 @@ class API:
 
             # 创建批处理脚本
             import tempfile
+            from . import updater
             bat_path = os.path.join(tempfile.gettempdir(), "apimonitor_updater.bat")
-
-            current_exe_name = os.path.basename(current_exe)
-            bat_content = f"""@echo off
-chcp 65001 >nul 2>&1
-set _MEIPASS=
-set _MEIPASS2=
-
-REM 直接结束进程，等待 2 秒让文件锁释放
-taskkill /f /im "{current_exe_name}" >nul 2>&1
-ping 127.0.0.1 -n 3 >nul 2>&1
-
-copy /Y "{temp_exe_path}" "{current_exe}" >nul 2>&1
-if errorlevel 1 (
-    rename "{current_exe}" "API-Monitor.old.exe" >nul 2>&1
-    copy /Y "{temp_exe_path}" "{current_exe}" >nul 2>&1
-    if errorlevel 1 (
-        exit /b 1
-    )
-    del "{current_exe}.old.exe" >nul 2>&1
-)
-
-start "" "{current_exe}"
-
-del "{temp_exe_path}" >nul 2>&1
-del "%~f0" >nul 2>&1
-"""
+            bat_content = updater.build_update_script(temp_exe_path, current_exe)
 
             with open(bat_path, "w", encoding="utf-8") as f:
                 f.write(bat_content)
