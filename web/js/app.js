@@ -245,7 +245,12 @@ class App {
         });
         // 新增/编辑表单：应用勾选切换对应输入组
         ['fAppClaude', 'fAppCodex'].forEach(id => {
-            document.getElementById(id)?.addEventListener('change', () => this._syncAppFields());
+            document.getElementById(id)?.addEventListener('change', () => {
+                this._syncAppFields();
+                // 勾选 Codex 时，若尚未独立配置 Codex，默认把上方 Claude Code 的设置带下来
+                //（API 格式除外：Codex 应使用最适合的 OpenAI Responses API，不跟随 Claude 的格式）
+                this._autoFillCodexFromClaude();
+            });
         });
         // 获取模型（每个应用一个按钮，data-app 定位）
         document.querySelectorAll('.btn-fetch-models').forEach(btn => {
@@ -1229,6 +1234,28 @@ class App {
             const cb = document.getElementById(app === 'codex' ? 'fAppCodex' : 'fAppClaude');
             g.style.display = (cb && cb.checked) ? '' : 'none';
         });
+    }
+
+    // 勾选 Codex 且尚无独立 Codex 配置时，将上方 Claude Code 的设置默认带到 Codex 输入组，
+    // 便于用户复用同一供应商的多数参数；需要不同处由用户自行修改。
+    // 例外：API 格式不跟随 Claude，始终使用 Codex 最适合的 OpenAI Responses API。
+    _autoFillCodexFromClaude() {
+        const codexChecked = document.getElementById('fAppCodex')?.checked;
+        if (!codexChecked) return;
+        const codexEndpoint = document.getElementById('fEndpointCodex')?.value?.trim() || '';
+        // 已有独立 Codex 配置（端点已填写）则不动，避免覆盖用户已填内容
+        if (codexEndpoint) return;
+
+        document.getElementById('fEndpointCodex').value =
+            document.getElementById('fEndpointClaude')?.value || '';
+        document.getElementById('fDefaultModelCodex').value =
+            document.getElementById('fDefaultModelClaude')?.value || '';
+        this._setCustomSelectValue('fReasoningEffortCodex',
+            this._getCustomSelectValue('fReasoningEffortClaude'));
+        this._setCustomSelectValue('fContextLengthCodex',
+            this._getCustomSelectValue('fContextLengthClaude'));
+        // API 格式：Codex 保持最适合的 OpenAI Responses API，不复制 Claude 的 Anthropic Messages
+        this._setCustomSelectValue('fApiFormatCodex', 'openai_responses');
     }
 
     renderProviders(providers, animate = true) {
@@ -2398,6 +2425,9 @@ class App {
         // --- per-provider test state ---
         if (this.testingIds.has(p.id)) return;  // already testing this one
         this.testingIds.add(p.id);
+        // 点击单个供应商的测试按钮后，右侧详情界面自动切换到 CLI 页签，
+        // 让测试过程的 CLI 日志实时展示出来
+        this.switchDetailTab('cli');
         this._updateTestBtnState(p.id);
         this.clearCliLogs();
         const t0 = performance.now();

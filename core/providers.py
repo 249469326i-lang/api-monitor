@@ -13,9 +13,17 @@ import hashlib
 import datetime
 import re
 import tomllib
+import time
+import threading
 import urllib.parse
 from typing import List, Dict, Any, Optional
 from . import db
+
+# Codex 模型目录缓存：{endpoint_key: (models, expire_ts)}
+# 避免每次「设为当前 Codex」都同步阻塞地打 /models；后台刷新命中缓存即可秒回。
+_codex_catalog_cache: Dict[str, tuple] = {}
+_codex_catalog_lock = threading.Lock()
+_CODEX_CATALOG_TTL = 300  # 5 分钟
 
 
 def import_from_ccswitch() -> Dict[str, Any]:
@@ -653,9 +661,11 @@ def _get_codex_config_path() -> str:
 
 
 def _toml_encode(value) -> str:
-    """把 Python 标量编码为 TOML 值: str → 基本字符串, bool → 裸字面量。"""
+    """把 Python 标量编码为 TOML 值: str → 基本字符串, bool/int/float → 裸字面量。"""
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
     return json.dumps(str(value), ensure_ascii=False)
 
 
@@ -683,20 +693,28 @@ def _toml_set_keys(text: str, key_values: Dict[str, Any], section: Optional[str]
         if current_section == section:
             m = re.match(r'^(\s*)([A-Za-z0-9_-]+)\s*=', line)
             if m and m.group(2) in key_values:
-                val = key_values[m.group(2)]
-                replaced.add(m.group(2))
+                key = m.group(2)
+                if key in replaced:
+                    # 该键已替换过 → 删除重复行（历史 BOM/残留可能产生重复 key）
+                    continue
+                val = key_values[key]
+                replaced.add(key)
                 if val is None:  # None 表示删除该键
                     continue
-                out.append(f"{m.group(1)}{m.group(2)} = {_toml_encode(val)}")
+                out.append(f"{m.group(1)}{key} = {_toml_encode(val)}")
                 continue
         elif section is None:
             m = re.match(r'^([A-Za-z0-9_-]+)\s*=', line)
             if m and m.group(1) in key_values:
-                val = key_values[m.group(1)]
-                replaced.add(m.group(1))
+                key = m.group(1)
+                if key in replaced:
+                    # 该键已替换过 → 删除重复行
+                    continue
+                val = key_values[key]
+                replaced.add(key)
                 if val is None:  # None 表示删除该键
                     continue
-                out.append(f"{m.group(1)} = {_toml_encode(val)}")
+                out.append(f"{key} = {_toml_encode(val)}")
                 continue
         out.append(line)
 
@@ -758,6 +776,87 @@ def _toml_remove_section(text: str, section: str) -> str:
     return "\n".join(out)
 
 
+def _set_codex_plugins_enabled(text: str, enabled: bool) -> str:
+    """批量设置 config.toml 中所有 [plugins."..."] 表的 enabled。
+
+    第三方中继场景用不到 Codex 官方插件（browser/chrome/文档/表格/网站等），
+    而它们自带的 skills 会占满 skills 上下文预算，触发 Codex 启动时的
+    "Skill descriptions were shortened" 警告。切到第三方供应商时统一禁用，
+    切回官方模式时（_clear_codex_official）恢复为启用。
+    """
+    try:
+        cfg = tomllib.loads(text)
+    except Exception:
+        # 配置暂时解析不了（如残留重复 key），不强行改动，避免越改越坏
+        return text
+    plugins = cfg.get("plugins") or {}
+    if not isinstance(plugins, dict):
+        return text
+    for name in plugins:
+        text = _toml_set_keys(text, {"enabled": enabled}, section=f'plugins."{name}"')
+    return text
+
+
+def _collect_codex_skill_paths() -> List[str]:
+    """收集 Codex 会加载的全部 SKILL.md 路径（agents / codex / marketplace）。
+
+    主要来源是 ~/.agents/skills（用户 agent 环境的 skills 会被 Codex 一并加载），
+    加上 ~/.codex/skills 与 marketplace 插件 skills。缺失目录安全跳过。
+    """
+    home = os.path.expanduser("~")
+    roots = [
+        os.path.join(home, ".agents", "skills"),
+        os.path.join(home, ".codex", "skills"),
+        os.path.join(home, ".codex", ".tmp", "bundled-marketplaces", "openai-bundled"),
+        os.path.join(home, ".cache", "codex-runtimes", "codex-primary-runtime",
+                     "plugins", "openai-primary-runtime"),
+    ]
+    found: List[str] = []
+    for r in roots:
+        if os.path.isdir(r):
+            found += glob.glob(os.path.join(r, "**", "SKILL.md"), recursive=True)
+    return sorted(set(found))
+
+
+def _disable_codex_skills(text: str) -> str:
+    """在 config.toml 末尾追加 [[skills.config]] enabled=false，禁用全部 skills。
+
+    大量 skills（尤其 ~/.agents/skills 的几十个）会占满 Codex 的 skills 上下文预算
+    （2%），触发 "Skill descriptions were shortened" 警告；第三方中继只支持
+    function/web_search 工具，skills 也用不上，因此统一切换时禁用。
+    切回官方模式时由 _remove_codex_skills_block 移除这些条目。
+    幂等：已存在旧的 [[skills.config]] 块时先截断再重建。
+    """
+    paths = _collect_codex_skill_paths()
+    if not paths:
+        return text
+    blocks = []
+    for s in paths:
+        blocks.append("\n[[skills.config]]\npath = %s\nenabled = false" % repr(s))
+    idx = text.find("[[skills.config]]")
+    base = text[:idx] if idx >= 0 else text
+    return base.rstrip("\n") + "\n" + "".join(blocks) + "\n"
+
+
+def _remove_codex_skills_block(text: str) -> str:
+    """移除 config.toml 中的 [[skills.config]] 块（切回官方模式时恢复 skills）。"""
+    lines = text.split("\n") if text else []
+    out: List[str] = []
+    skip = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[[skills.config]]"):
+            skip = True
+            continue
+        if skip:
+            if stripped.startswith("[") and not stripped.startswith("[[skills.config]]"):
+                skip = False
+            else:
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _read_codex_effective_config() -> Dict[str, str]:
     """
     读取 Codex 当前生效配置: ~/.codex/config.toml 的 model / model_provider /
@@ -768,8 +867,10 @@ def _read_codex_effective_config() -> Dict[str, str]:
     path = _get_codex_config_path()
     if os.path.exists(path):
         try:
+            # utf-8-sig: 去掉 Codex 桌面版写入的 BOM，否则 tomllib 解析报 "Invalid statement"
             with open(path, "rb") as f:
-                cfg = tomllib.load(f)
+                raw = f.read()
+            cfg = tomllib.loads(raw.decode("utf-8-sig"))
         except Exception:
             cfg = {}
     if not isinstance(cfg, dict):
@@ -916,75 +1017,121 @@ def _deepseek_responses_supported(model_id: str) -> bool:
     return "deepseek-v4-flash" in (model_id or "").strip().lower()
 
 
-def _resolve_codex_model(provider: Dict[str, Any], binding: Dict[str, Any]) -> tuple:
+def _resolve_codex_model(provider: Dict[str, Any], binding: Dict[str, Any],
+                         force_fetch: bool = False) -> tuple:
     """解析要写入 config.toml 的默认模型。
 
-    绑定有 default_model 直接用；为空时尝试从端点 /models 拉取，
-    取第一个作为默认模型，并返回可写入 catalog 的完整模型列表。
+    绑定有 default_model 直接用；为空时从端点 /models 拉取取首个回填。
+    **安全**：DeepSeek 端点或能力过滤后发现配置模型不支持 Responses API 时，
+    会同步纠正到兼容模型（写错模型会让 Codex /responses 直接报错）。
+    **性能**：拉取走 _fetch_codex_models，带 5 分钟内存缓存，命中即秒回、不打网络。
     返回 (model, catalog_models, warning)；warning 为需要提示用户的信息（可为空串）。
     拉取失败且无配置时 model 为空。
     """
     b = binding or provider
     model = (b.get("default_model") or "").strip()
     endpoint = (b.get("endpoint") or "").strip()
-    api_format = (b.get("api_format") or "").strip().lower()
-    api_key = (provider.get("api_key") or "").strip()
     warning = ""
 
     catalog_models = None
     if endpoint:
-        try:
-            from . import testing
-            # Codex 只支持 Responses API：拉列表时按 supports_responses 能力过滤
-            fetched = testing.fetch_models(
-                endpoint, api_key, api_format,
-                default_model=model, responses_only=True,
-            )
-            if isinstance(fetched, dict) and fetched.get("success"):
-                models = [m.strip() for m in (fetched.get("models") or []) if isinstance(m, str) and m.strip()]
-                if models:
-                    responses_filtered = bool(fetched.get("responses_filtered"))
-                    # DeepSeek 特判：其官方 /models 不带 supports_responses 字段，导致上面
-                    # responses_only 的能力过滤失效；而 DeepSeek 的 Responses API 目前仅支持
-                    # deepseek-v4-flash（v4-pro / 旧别名 deepseek-chat 等均不支持）。这里
-                    # 显式把不支持 Responses 的模型剔除，避免把 v4-pro 写进 Codex 配置。
-                    ds = _is_deepseek_endpoint(endpoint)
-                    if ds:
-                        ds_supported = [m for m in models if _deepseek_responses_supported(m)]
-                        if ds_supported:
-                            models = ds_supported
-                            responses_filtered = True
-                    if not model:
-                        model = models[0]
-                    elif model not in models:
-                        if responses_filtered:
-                            # 用户配置的模型不支持 Responses API → 优先换同系列兼容模型
-                            match = next((m for m in models if m.startswith(model)), None)
-                            if match is None:
-                                match = models[0]
-                            warning = (
-                                f"{model} 不支持 Responses API，已改用 {match}。"
-                                "Codex 自 2026-02 起仅支持 Responses 接口"
-                            )
-                            model = match
-                        else:
-                            # 无能力信息：模型列表可能只是别名，保留用户配置
-                            models = [model] + models
-                    # DeepSeek 场景：用户显式配置了非 v4-flash 模型（如 deepseek-v4-pro /
-                    # deepseek-chat）时强制纠正，避免 /responses 被拒。
-                    elif ds and not _deepseek_responses_supported(model):
-                        match = next((m for m in models if _deepseek_responses_supported(m)), models[0] if models else model)
+        fetched = _fetch_codex_models(provider, b, use_cache=not force_fetch)
+        if isinstance(fetched, dict) and fetched.get("success"):
+            models = [m.strip() for m in (fetched.get("models") or []) if isinstance(m, str) and m.strip()]
+            if models:
+                responses_filtered = bool(fetched.get("responses_filtered"))
+                # DeepSeek 特判：其官方 /models 不带 supports_responses 字段，导致上面
+                # responses_only 的能力过滤失效；而 DeepSeek 的 Responses API 目前仅支持
+                # deepseek-v4-flash（v4-pro / 旧别名 deepseek-chat 等均不支持）。这里
+                # 显式把不支持 Responses 的模型剔除，避免把 v4-pro 写进 Codex 配置。
+                ds = _is_deepseek_endpoint(endpoint)
+                if ds:
+                    ds_supported = [m for m in models if _deepseek_responses_supported(m)]
+                    if ds_supported:
+                        models = ds_supported
+                        responses_filtered = True
+                if not model:
+                    model = models[0]
+                elif model not in models:
+                    if responses_filtered:
+                        # 用户配置的模型不支持 Responses API → 优先换同系列兼容模型
+                        match = next((m for m in models if m.startswith(model)), None)
+                        if match is None:
+                            match = models[0]
                         warning = (
-                            f"{model} 不支持 Responses API，已改用 {match} 供 Codex 使用。"
-                            "DeepSeek 仅 deepseek-v4-flash 支持 Responses 接口"
+                            f"{model} 不支持 Responses API，已改用 {match}。"
+                            "Codex 自 2026-02 起仅支持 Responses 接口"
                         )
                         model = match
-                    catalog_models = models
-        except Exception:
-            catalog_models = None
+                    else:
+                        # 无能力信息：模型列表可能只是别名，保留用户配置
+                        models = [model] + models
+                # DeepSeek 场景：用户显式配置了非 v4-flash 模型（如 deepseek-v4-pro /
+                # deepseek-chat）时强制纠正，避免 /responses 被拒。
+                elif ds and not _deepseek_responses_supported(model):
+                    match = next((m for m in models if _deepseek_responses_supported(m)), models[0] if models else model)
+                    warning = (
+                        f"{model} 不支持 Responses API，已改用 {match} 供 Codex 使用。"
+                        "DeepSeek 仅 deepseek-v4-flash 支持 Responses 接口"
+                    )
+                    model = match
+                catalog_models = models
     if catalog_models is None and model:
         catalog_models = [model]
     return model, catalog_models, warning
+
+
+def clear_codex_catalog_cache() -> None:
+    """清空 Codex 模型目录缓存（测试隔离用）。"""
+    with _codex_catalog_lock:
+        _codex_catalog_cache.clear()
+
+
+def _codex_catalog_key(endpoint: str, api_key: str) -> str:
+    """缓存键：按端点 + api key 指纹分组，避免不同供应商串缓存。"""
+    fp = hashlib.md5((api_key or "").encode("utf-8")).hexdigest()[:8]
+    return f"{(endpoint or '').strip().rstrip('/').lower()}|{fp}"
+
+
+def _fetch_codex_models(provider: Dict[str, Any], binding: Dict[str, Any],
+                        use_cache: bool = True) -> Dict[str, Any]:
+    """拉取 Codex 模型列表，带 5 分钟内存缓存。
+
+    use_cache=True 时优先返回未过期的缓存，命中则不打网络；否则强制刷新。
+    缓存仅存「模型 id 列表」，能力(supports_responses)信息不缓存（仍按实时响应判定），
+    因此安全纠正逻辑不受缓存影响。
+    """
+    b = binding or provider
+    endpoint = (b.get("endpoint") or "").strip()
+    api_format = (b.get("api_format") or "").strip().lower()
+    api_key = (provider.get("api_key") or "").strip()
+    model = (b.get("default_model") or "").strip()
+    if not endpoint:
+        return {"success": False, "error": "未提供端点 URL"}
+
+    key = _codex_catalog_key(endpoint, api_key)
+    if use_cache:
+        with _codex_catalog_lock:
+            cached = _codex_catalog_cache.get(key)
+            now = time.time()
+            if cached and cached[1] > now:
+                return {"success": True, "models": cached[0], "responses_filtered": False, "cached": True}
+
+    try:
+        from . import testing
+        # Codex 只支持 Responses API：拉列表时按 supports_responses 能力过滤
+        result = testing.fetch_models(
+            endpoint, api_key, api_format,
+            default_model=model, responses_only=True,
+        )
+        # 写入缓存（仅成功结果缓存 5 分钟）
+        if isinstance(result, dict) and result.get("success"):
+            models = [m.strip() for m in (result.get("models") or []) if isinstance(m, str) and m.strip()]
+            with _codex_catalog_lock:
+                _codex_catalog_cache[key] = (models, time.time() + _CODEX_CATALOG_TTL)
+        return result
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 def _write_codex_config(provider: Dict[str, Any], binding: Optional[Dict[str, Any]] = None,
@@ -1000,7 +1147,9 @@ def _write_codex_config(provider: Dict[str, Any], binding: Optional[Dict[str, An
     text = ""
     if os.path.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            # utf-8-sig: 去掉 Codex 桌面版写入的 UTF-8 BOM，避免 \ufeff 粘在首个 key 上
+            # 导致 _toml_set_keys 匹配不到而重复插入同 key（Codex 报 duplicate key 直接退出）
+            with open(path, "r", encoding="utf-8-sig") as f:
                 text = f.read()
         except Exception:
             text = ""
@@ -1066,11 +1215,32 @@ def _write_codex_config(provider: Dict[str, Any], binding: Optional[Dict[str, An
     # multi-agent 会把工具打包成 type:"namespace"（multi_agent_v1），freeform
     # apply_patch 发 type:"custom"，MCP 服务器工具也归到 namespace 下，
     # 都会被中继以 tool.namespace / tool.custom 拒绝，因此统一在配置里关闭。
+    # 其余 features 为消除第三方模式（API key，非 ChatGPT 登录）下的启动警告：
+    #   apps=false           关闭 codex_apps 连接器 MCP，否则启动即打 chatgpt.com 报 403
+    #   remote_plugin=false  关闭远程插件目录同步（API key 不支持 ChatGPT 认证）
+    #   shell_snapshot=false 关闭 shell 环境快照（PowerShell 不支持）
+    #   memories=false       关闭记忆（写记忆需要官方模型 gpt-5.6-luna，第三方 API 没有）
     text = _toml_set_keys(text, {
         "multi_agent": False,
         "apply_patch_freeform": False,
+        "apps": False,
+        "remote_plugin": False,
+        "shell_snapshot": False,
+        "memories": False,
     }, section="features")
-    text = _toml_set_keys(text, {"enabled": False}, section="mcp_servers.node_repl")
+    text = _toml_set_keys(text, {
+        "generate_memories": False,
+        "use_memories": False,
+    }, section="memories")
+    # 彻底删除 node_repl MCP 服务器配置（含 env 子表），避免任何 MCP 加载尝试
+    text = _toml_remove_section(text, "mcp_servers.node_repl")
+    # Codex 官方插件（browser/chrome/文档/表格等）自带大量 skills，会占满
+    # skills 上下文预算，触发 "Skill descriptions were shortened" 警告；
+    # 第三方中继用不到这些插件，统一切换时禁用（官方模式由 _clear_codex_official 恢复）。
+    text = _set_codex_plugins_enabled(text, False)
+    # 全部 skills（~/.agents/skills 几十个 + marketplace）统一禁用，消除
+    # "Skill descriptions were shortened" 警告并省上下文（官方模式恢复）。
+    text = _disable_codex_skills(text)
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = path + ".tmp"
@@ -1084,12 +1254,16 @@ def _write_codex_config(provider: Dict[str, Any], binding: Optional[Dict[str, An
 
 def _set_codex_current(provider: Dict[str, Any], binding: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """将指定供应商设为当前 Codex 配置（写入 ~/.codex/config.toml）。
-    binding 为 codex 绑定（含独立端点/模型/格式），缺省回退 provider 顶层字段。"""
+    binding 为 codex 绑定（含独立端点/模型/格式），缺省回退 provider 顶层字段。
+
+    性能：已配置默认模型时本函数**不阻塞**于 /models 网络请求——立即写配置并返回成功，
+    模型目录(catalog)在后台线程异步刷新（_refresh_codex_catalog_async）。
+    仅当默认模型为空、必须靠 /models 才能确定模型时才在此同步拉取。
+    """
     b = binding or provider
     if not (b.get("endpoint") or "").strip():
         return {"success": False, "error": "未配置端点"}
-    # 默认模型为空时自动从端点拉取并回填；仍拿不到则明确报错，
-    # 避免 Codex 落到官方模型名导致第三方 API 报"模型不存在"。
+    # 默认模型为空时仍需同步拉取（否则写不进配置）；已配置则跳过网络，秒回。
     model, catalog_models, warning = _resolve_codex_model(provider, b)
     if not model:
         return {
@@ -1114,6 +1288,48 @@ def _set_codex_current(provider: Dict[str, Any], binding: Optional[Dict[str, Any
     if warning:
         message = f"{message}（{warning}）"
     return {"success": True, "message": message}
+
+
+def _refresh_codex_catalog_async(provider_id: int,
+                                 on_done: Optional[callable] = None) -> None:
+    """后台异步刷新 Codex 模型目录并重写 config.toml。
+
+    切换为当前 Codex 时主流程已用「已有的默认模型」秒写配置返回；这里在后台补全
+    完整模型列表并写入 model_catalog_json，让 Codex 模型选择器显示该供应商真实模型。
+    带过期守卫：若后台刷新期间用户又切到别的供应商，则不写回，避免覆盖成旧供应商。
+    on_done(): 完成后回调（用于推送前端刷新），可选。
+    """
+    try:
+        provider = db.get_provider_by_id(provider_id)
+        if not provider:
+            return
+        binding = _binding(provider, "codex")
+        if not binding:
+            return
+        # 强制刷新（绕过缓存），拿到最新模型列表
+        model, catalog_models, warning = _resolve_codex_model(provider, binding, force_fetch=True)
+
+        # 过期守卫：确认此刻仍是本供应商为当前 codex，否则丢弃结果（用户已切到别的供应商）
+        if db.get_current_provider_id("codex") != provider_id:
+            return
+
+        if model and catalog_models:
+            try:
+                db.update_binding_default_model(provider_id, "codex", model)
+            except Exception:
+                pass
+            try:
+                _write_codex_config(provider, binding, catalog_models=catalog_models, model=model)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        if on_done:
+            try:
+                on_done()
+            except Exception:
+                pass
 
 
 # ────────────────── 官方 / 第三方模式 ──────────────────
@@ -1154,7 +1370,8 @@ def _clear_codex_official() -> tuple:
     text = ""
     if os.path.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            # utf-8-sig: 去掉 BOM（见 _write_codex_config 注释）
+            with open(path, "r", encoding="utf-8-sig") as f:
                 text = f.read()
         except Exception:
             text = ""
@@ -1164,6 +1381,18 @@ def _clear_codex_official() -> tuple:
         section=None,
     )
     text = _toml_remove_section(text, "model_providers.api_monitor")
+    # 切回官方模式：恢复被第三方配置禁用的 Codex 官方插件与全部 skills
+    text = _set_codex_plugins_enabled(text, True)
+    text = _remove_codex_skills_block(text)
+    # 恢复被第三方配置关闭的 features（官方 ChatGPT 登录下这些功能可用）
+    text = _toml_set_keys(text, {
+        "multi_agent": True,
+        "apply_patch_freeform": True,
+        "apps": True,
+        "remote_plugin": True,
+        "shell_snapshot": True,
+        "memories": True,
+    }, section="features")
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp_path = path + ".tmp"

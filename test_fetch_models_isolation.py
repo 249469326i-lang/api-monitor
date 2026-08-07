@@ -785,6 +785,8 @@ class CodexConfigTest(unittest.TestCase):
         os.environ["HOME"] = self._tmp
         os.environ["API_MONITOR_DATA_DIR"] = os.path.join(self._tmp, "data")
         db.init_db()
+        # 清空 Codex 模型目录缓存，避免跨用例污染（缓存是模块级单例）
+        providers.clear_codex_catalog_cache()
         # 统一 mock 端点模型列表，避免 set_current 写配置时打真实网络
         self._fetch_models_patcher = patch(
             "core.testing.fetch_models",
@@ -1211,7 +1213,13 @@ class CodexConfigTest(unittest.TestCase):
         # 被第三方中继以 tool.namespace / tool.custom 拒绝,必须默认关闭
         self.assertIs(cfg["features"]["multi_agent"], False)
         self.assertIs(cfg["features"]["apply_patch_freeform"], False)
-        self.assertIs(cfg["mcp_servers"]["node_repl"]["enabled"], False)
+        # node_repl MCP 整个表被删除（而非仅 enabled=false），避免任何 MCP 加载
+        self.assertNotIn("node_repl", cfg.get("mcp_servers") or {})
+        # 第三方模式（API key 非 ChatGPT 登录）下关闭会触发警告/失败的功能
+        self.assertIs(cfg["features"]["apps"], False)
+        self.assertIs(cfg["features"]["remote_plugin"], False)
+        self.assertIs(cfg["features"]["shell_snapshot"], False)
+        self.assertIs(cfg["features"]["memories"], False)
         self.assertEqual(cfg["model_providers"]["api_monitor"]["base_url"], "https://api.picpi.top/v1")
         with open(cfg["model_catalog_json"], "r", encoding="utf-8") as f:
             entry = json.load(f)["models"][0]
@@ -1250,6 +1258,10 @@ class DeepSeekCodexProviderTest(unittest.TestCase):
     （deepseek-v4-pro / 旧别名 deepseek-chat 均不支持），且 Responses 的
     base_url 必须是根路径 https://api.deepseek.com（不能追加 /v1）。
     """
+
+    def setUp(self):
+        # 清空模块级模型目录缓存，避免同端点不同 mock 返回值之间的串扰
+        providers.clear_codex_catalog_cache()
 
     def test_resolve_codex_model_deepseek_picks_v4flash_when_default_empty(self):
         provider = {"api_key": "sk-ds", "name": "DeepSeek"}

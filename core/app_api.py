@@ -983,6 +983,12 @@ class API:
                 failover.reset_counter()
                 logger.info(f"Current provider set: id={pid}, app={app_type}")
                 self._refresh_frontend()
+                # Codex：模型目录(catalog)在后台异步刷新，避免 /models 网络请求阻塞切换；
+                # 后台完成后再次刷新前端，让 UI 显示补全后的模型信息。
+                if app_type == "codex":
+                    def _bg():
+                        providers._refresh_codex_catalog_async(pid, on_done=self._refresh_frontend)
+                    threading.Thread(target=_bg, daemon=True, name="CodexCatalogRefresh").start()
             return result
         except Exception as e:
             return {"success": False, "error": str(e)}

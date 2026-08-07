@@ -45,6 +45,7 @@ logs/
 tmp/
 temp/
 *.tmp
+rebuild_log.txt
 
 # Probe / internal debug scripts (do not publish)
 _probe_*.py

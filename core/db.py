@@ -392,6 +392,21 @@ def mark_app_current(provider_id: int, app_type: str) -> None:
         pass
 
 
+def get_current_provider_id(app_type: str) -> Optional[int]:
+    """返回指定应用下当前 role=当前 的供应商 id；无则返回 None。"""
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT provider_id FROM provider_apps WHERE app_type=? AND role='当前' LIMIT 1",
+                (app_type,),
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
 def clear_app_roles(app_type: str) -> None:
     """把某应用下所有绑定置备用（官方模式），并同步受影响供应商镜像。"""
     try:
